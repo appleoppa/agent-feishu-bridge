@@ -125,7 +125,7 @@ function repairMarkdownTables(text) {
     const headerCells = parseMarkdownTableRow(line);
     const nextLine = lines[index + 1] || "";
 
-    if (headerCells && headerCells.length >= 2 && looksLikeTableSeparator(nextLine)) {
+    if (headerCells && headerCells.length >= 1 && looksLikeTableSeparator(nextLine)) {
       if (output.length && output[output.length - 1].trim() && !previousWasTable) {
         output.push("");
       }
@@ -137,7 +137,7 @@ function repairMarkdownTables(text) {
     }
 
     const rowCells = previousWasTable ? parseLooseMarkdownTableRow(line) : null;
-    if (rowCells && rowCells.length >= 2) {
+    if (rowCells && rowCells.length >= 1) {
       output.push(formatTableDataLine(padTableCells(rowCells, tableColumnCount)));
       previousWasTable = true;
       continue;
@@ -165,7 +165,7 @@ function parseMarkdownTableRow(line) {
     .slice(1, -1)
     .split("|")
     .map((cell) => String(cell || "").trim().replace(/\u0001/g, "|"));
-  return cells.length >= 2 ? cells : null;
+  return cells.length >= 1 ? cells : null;
 }
 
 function parseLooseMarkdownTableRow(line) {
