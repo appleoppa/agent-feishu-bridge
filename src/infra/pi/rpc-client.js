@@ -119,6 +119,7 @@ class PiRpcClient {
     this.listeners = [];
     this.threads = new Map();   // threadId -> { sessionId, cwd }
     this.running = new Map();   // threadId -> { child, ctx }
+    this.sessionStatsWaiters = new Map(); // threadId -> finish()（get_session_stats 响应等待）
     this.connected = false;
   }
 
@@ -672,24 +673,88 @@ class PiRpcClient {
           item: { id: `msg-${turnId}`, type: "agentMessage", text: ctx.pendingFinalText },
         });
       }
-      if (ctx.turnError) {
-        this.emit("turn/failed", {
-          threadId: tid,
-          turnId,
-          error: { message: ctx.turnError.slice(0, 600) },
-        });
-      } else {
-        this.emit("turn/completed", { threadId: tid, turnId });
-      }
-      this.finishTurn(ctx);
+      // 本轮定稿后、发出终态事件前，请求一次会话用量（token/上下文窗口），
+      // 让卡片尾部能显示「📝 上下文 xx/xx · 进度条」（与 Codex/Claude/OpenCode 后端一致）。
+      // 子进程可能已退出或超时：任何失败都静默降级，不影响终态交付。
+      this._requestSessionStats(tid, ctx).then(() => {
+        if (ctx.turnError) {
+          this.emit("turn/failed", {
+            threadId: tid,
+            turnId,
+            error: { message: ctx.turnError.slice(0, 600) },
+          });
+        } else {
+          this.emit("turn/completed", { threadId: tid, turnId });
+        }
+        this.finishTurn(ctx);
+      });
       return;
     }
 
-    if (type === "response" && event?.success === false) {
-      // prompt 被拒绝（如模型错误）——从 response 里读错误
-      ctx.turnError = ctx.turnError || String(event?.error || "Pi 拒绝了本次请求");
+    if (type === "response") {
+      if (event?.command === "get_session_stats" && event?.success) {
+        this._handleSessionStatsResponse(ctx, event);
+        return;
+      }
+      if (event?.success === false) {
+        // prompt 被拒绝（如模型错误）——从 response 里读错误
+        ctx.turnError = ctx.turnError || String(event?.error || "Pi 拒绝了本次请求");
+        return;
+      }
       return;
     }
+  }
+
+  // ── 会话用量上报（卡片尾部「📝 上下文」）────────────────
+  _requestSessionStats(threadId, ctx) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) {
+          return;
+        }
+        done = true;
+        this.sessionStatsWaiters.delete(threadId);
+        resolve();
+      };
+      const timer = setTimeout(finish, 1500);
+      this.sessionStatsWaiters.set(threadId, finish);
+      try {
+        if (!ctx.child || ctx.child.stdin.destroyed) {
+          clearTimeout(timer);
+          finish();
+          return;
+        }
+        ctx.child.stdin.write(`${JSON.stringify({ type: "get_session_stats" })}\n`);
+      } catch {
+        clearTimeout(timer);
+        finish();
+      }
+    });
+  }
+
+  _resolveSessionStats(threadId) {
+    const waiter = this.sessionStatsWaiters.get(threadId);
+    if (typeof waiter === "function") {
+      waiter();
+    }
+  }
+
+  _handleSessionStatsResponse(ctx, event) {
+    const data = event?.data || {};
+    const ctxUsage = data?.contextUsage || {};
+    const tokens = Number(ctxUsage?.tokens);
+    const window = Number(ctxUsage?.contextWindow);
+    if (Number.isFinite(tokens) && Number.isFinite(window) && tokens > 0 && window > 0) {
+      this.emit("thread/tokenUsage/updated", {
+        threadId: ctx.threadId,
+        tokenUsage: {
+          last: { totalTokens: tokens },
+          modelContextWindow: window,
+        },
+      });
+    }
+    this._resolveSessionStats(ctx.threadId);
   }
 
   finishTurn(ctx) {
