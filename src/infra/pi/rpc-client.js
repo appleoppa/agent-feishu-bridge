@@ -589,7 +589,10 @@ class PiRpcClient {
       // 避免飞书卡片出现“全文 + 增量”重复。
       const message = event?.message || {};
       const content = extractMessageText(message);
-      if (content && !ctx.pendingFinalText) {
+      // Pi 一轮 turn 会连续发多条 message_end（工具调用间隙的中间汇报 + 最终答复）。
+      // 必须始终取“最新一条”作为定稿快照：只取第一条会导致最终覆盖被
+      // “短快照不覆盖长正文”保护挡住，最终卡保留中间汇报拼接（无换行、一坨）。
+      if (content) {
         ctx.pendingFinalText = content;
       }
       const reason = String(message?.stopReason || message?.reason || "").toLowerCase();

@@ -543,14 +543,12 @@ function applyCompletedAssistantSnapshot(entry, text) {
     entry.processText = mergeProcessText(entry.processText, processPrefix);
   }
 
-  // The completed snapshot is the authoritative final text. Never let a short
-  // partial snapshot overwrite a longer body, but avoid merging: delta text and
-  // snapshot can differ in whitespace/punctuation, and a naive concat would
-  // duplicate the answer.
-  if (!accumulated || completedText.length >= accumulated.length) {
-    entry.answerText = completedText;
-    entry.text = completedText;
-  }
+  // 定稿快照（message_end 完整文本）是权威最终正文，一律覆盖：
+  // Pi 一轮会流式输出多条中间汇报（工具间隙的“我先实查…”等），它们拼接进
+  // entry.text 会导致最终卡片正文粘连；快照是最新一条完整答复，覆盖后正文干净。
+  // 快照由 Pi 的 message_end 提供（每条都是完整消息，不是部分快照），覆盖安全。
+  entry.answerText = completedText;
+  entry.text = completedText;
 }
 
 function extractProcessPrefixFromCompletedSnapshot(accumulated, completedText) {
@@ -741,6 +739,21 @@ async function finalizeCardKitReply(runtime, entry) {
   const adapter = runtime.requireFeishuAdapter();
   const display = buildAssistantDisplayContent(entry);
   const card = buildCardKitFinalCard(runtime, entry, display);
+
+  // [debug] 打印最终卡元素结构摘要，便于定位渲染异常
+  try {
+    const bodyElements = (card?.body?.elements || []).map((el) => {
+      if (el?.tag === "column_set" && Array.isArray(el?.column_list)) {
+        return el.column_list.map((col) => (col?.elements || []).map((c) => c?.tag)).join("|");
+      }
+      return String(el?.tag || "?");
+    });
+    const summary = (card?.body?.elements || []).map((el) => el?.tag).join(",");
+    const contentSnippet = String(display?.answer || "").slice(0, 120).replace(/\n/g, "\\n");
+    console.log(`[cardkit] FINAL card summary=${summary} bodyElements=${bodyElements.join(" ; ")} contentHead=${contentSnippet}`);
+  } catch (debugErr) {
+    console.warn(`[cardkit] debug log failed: ${debugErr.message}`);
+  }
 
   entry.cardKitSequence += 1;
   await adapter.setCardStreamingMode({
