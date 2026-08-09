@@ -266,10 +266,13 @@ class PiRpcClient {
     }
 
     const catalog = models && models.length ? models : STATIC_MODEL_CATALOG;
+    // 以 provider 名为 model（dedupeKey），避免与真实模型名重复被 normalizeModelCatalog 去重吞掉；
+    // 真实模型名放 displayName 展示。findModelByQuery("maoge-dp4") / ("sol") 均能匹配。
     const data = catalog.map((entry, index) => ({
-      id: entry.id,
-      model: entry.id,
-      displayName: entry.displayName || entry.id,
+      id: entry.provider || entry.id,
+      model: entry.provider || entry.id,
+      displayName: entry.displayName || `${entry.provider || entry.id} / ${entry.id}`,
+      rawModel: entry.id,
       supportedReasoningEfforts: [...PI_THINKING_LEVELS],
       isDefault: entry.provider === this.defaultProvider || (index === 0 && !models),
     }));
@@ -899,4 +902,10 @@ function buildApprovalSummary(method, title, message, options) {
   return `${method} 请求`;
 }
 
-module.exports = { PiRpcClient, buildPiArgs, parsePiModelList };
+module.exports = {
+  PiRpcClient,
+  // runtime 统一用 CodexRpcClient 解构（各后端同一接口），pi 模块兼容导出
+  CodexRpcClient: PiRpcClient,
+  buildPiArgs,
+  parsePiModelList,
+};
