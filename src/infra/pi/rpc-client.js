@@ -679,9 +679,11 @@ class PiRpcClient {
     }
 
     if (type === "agent_settled") {
-      // 兜底：本轮没有任何流式增量时，把 message_end 的完整文本补发为 completed_snapshot。
-      // 有增量时跳过（增量已实时上卡，补全文会重复）。
-      if (!ctx.sawText && ctx.pendingFinalText) {
+      // 定稿：一律补发 message_end 完整文本为 completed_snapshot。
+      // 之前“有 delta 就跳过”会导致流式增量丢换行时最终卡片正文粘连
+      // （Pi 的 text_delta 偶发丢失 \n，session 完整文本则保留换行）；
+      // 下游 applyCompletedAssistantSnapshot 会以快照覆盖增量（更长才覆盖，不重复）。
+      if (ctx.pendingFinalText) {
         this.emit("item/completed", {
           threadId: tid,
           turnId,
