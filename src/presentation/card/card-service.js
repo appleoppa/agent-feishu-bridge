@@ -1050,6 +1050,12 @@ function buildToolPanelTitle(toolItems, state) {
 }
 
 function buildCardKitStreamingContent(entry) {
+  // 流式阶段只显示占位：飞书 streaming 状态渲染不认空行分段（实测：
+  // streaming_mode=true 时 markdown 空行被压平，多段正文在生成中显示为“一坨”）。
+  // 正文改为生成完成后由 buildCardKitFinalCard 一次性渲染，保证用户永远看到完整正常排版。
+  if (entry.state === "streaming") {
+    return "⏳ 正在生成回复…（内容生成完成后显示）";
+  }
   return buildAssistantDisplayContent(entry).answer;
 }
 
