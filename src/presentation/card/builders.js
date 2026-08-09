@@ -416,52 +416,17 @@ function buildWelcomeCard({
     { tag: "markdown", content: buildAgentLine(backend), text_size: "normal" },
     {
       tag: "markdown",
-      content: "绑定项目后即可开始对话，只需填写文件夹名：",
+      content: "这个会话还没有绑定项目。",
       text_size: "notation",
     },
     {
-      tag: "form_container",
-      name: "bind_form",
-      elements: [
-        {
-          tag: "column_set",
-          flex_mode: "none",
-          columns: [
-            {
-              tag: "column",
-              width: "weighted",
-              weight: 2,
-              elements: [
-                {
-                  tag: "input",
-                  name: "project_name",
-                  placeholder: {
-                    tag: "plain_text",
-                    content: `文件夹名，自动补全为 ${projectsRoot}/…`,
-                  },
-                },
-              ],
-            },
-            {
-              tag: "column",
-              width: "weighted",
-              weight: 1,
-              elements: [
-                buildFormSubmitButton({
-                  name: "submit_bind",
-                  text: "🔗 绑定",
-                  value: { kind: "form", action: "bind_project" },
-                  type: "primary",
-                }),
-              ],
-            },
-          ],
-        },
-      ],
+      tag: "markdown",
+      content: `发送 \`/bind /绝对路径\`（例如 \`/bind ${escapeCardMarkdown(projectsRoot)}/某项目\`）绑定项目后即可开始对话。`,
+      text_size: "notation",
     },
     {
       tag: "markdown",
-      content: `📌 自动补全到 \`${escapeCardMarkdown(projectsRoot)}/文件夹名\`，也可输入绝对路径`,
+      content: "💡 本项目默认工作目录为当前会话绑定的项目；绑定后每次消息都会在对应项目下处理。",
       text_size: "notation",
     }
   );

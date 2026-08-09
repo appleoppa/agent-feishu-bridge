@@ -228,6 +228,11 @@ class FeishuBotRuntime {
     const eventDispatcher = new this.lark.EventDispatcher({}).register({
       "im.message.receive_v1": async (data) => {
         const messageId = String(data?.message?.message_id || "").trim();
+        // 入口日志：记录会话定位信息，便于排查消息路径（不含消息正文）
+        const chatId = String(data?.message?.chat_id || "").trim();
+        const openId = String(data?.sender?.sender_id?.open_id || "").trim();
+        const threadId = String(data?.message?.thread_id || "").trim();
+        console.log(`[codex-im] im.message.receive_v1 chat=${chatId || "-"} sender=${openId || "-"} thread=${threadId || "-"} msg=${messageId || "-"}`);
         const ledgerClaim = await this.deliveryReceipts.claimInbound(data);
         if (ledgerClaim.duplicate) {
           console.warn("[codex-im] ignored duplicate Feishu message from delivery ledger");
