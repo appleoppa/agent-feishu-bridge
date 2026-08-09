@@ -109,9 +109,16 @@ function downgradeHeadingsForCardKit(text) {
 }
 
 function repairMarkdownTables(text) {
+  // 飞书卡片 lark_md 不支持 GFM 表格语法（竖线行渲染不成表格），
+  // 因此把 markdown 表格块转成 lark_md 可渲染的形式：
+  //   表头行 → **单元格1 ｜ 单元格2**（加粗）
+  //   数据行 → - 单元格1 ｜ 单元格2（无序列表）
+  //   分隔行 → 丢弃
+  // 分隔符用全角竖线（｜），避免与 markdown 列表/竖线语法冲突。
   const lines = String(text || "").split("\n");
   const output = [];
   let previousWasTable = false;
+  let tableColumnCount = 0;
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
@@ -122,8 +129,8 @@ function repairMarkdownTables(text) {
       if (output.length && output[output.length - 1].trim() && !previousWasTable) {
         output.push("");
       }
-      output.push(formatMarkdownTableRow(headerCells));
-      output.push(formatMarkdownTableSeparator(headerCells.length));
+      tableColumnCount = headerCells.length;
+      output.push(formatTableHeaderLine(headerCells));
       previousWasTable = true;
       index += 1;
       continue;
@@ -131,7 +138,7 @@ function repairMarkdownTables(text) {
 
     const rowCells = previousWasTable ? parseLooseMarkdownTableRow(line) : null;
     if (rowCells && rowCells.length >= 2) {
-      output.push(formatMarkdownTableRow(padTableCells(rowCells, output[output.length - 1])));
+      output.push(formatTableDataLine(padTableCells(rowCells, tableColumnCount)));
       previousWasTable = true;
       continue;
     }
@@ -141,6 +148,7 @@ function repairMarkdownTables(text) {
     }
     output.push(line);
     previousWasTable = false;
+    tableColumnCount = 0;
   }
 
   return output.join("\n");
@@ -151,7 +159,12 @@ function parseMarkdownTableRow(line) {
   if (!trimmed.startsWith("|") || !trimmed.endsWith("|")) {
     return null;
   }
-  const cells = trimmed.slice(1, -1).split("|").map((cell) => cell.trim());
+  // 先保护转义竖线（\|），切分后再还原，避免单元格内容被拆开
+  const protectedText = trimmed.replace(/\\\|/g, "\u0001");
+  const cells = protectedText
+    .slice(1, -1)
+    .split("|")
+    .map((cell) => String(cell || "").trim().replace(/\u0001/g, "|"));
   return cells.length >= 2 ? cells : null;
 }
 
@@ -177,17 +190,15 @@ function looksLikeTableSeparator(line) {
   return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
 }
 
-function formatMarkdownTableRow(cells) {
-  return `| ${cells.map((cell) => String(cell || "").trim()).join(" | ")} |`;
+function formatTableHeaderLine(cells) {
+  return `**${cells.map((cell) => String(cell || "").trim()).join(" ｜ ")}**`;
 }
 
-function formatMarkdownTableSeparator(count) {
-  return `| ${Array.from({ length: Math.max(2, count) }, () => "---").join(" | ")} |`;
+function formatTableDataLine(cells) {
+  return `- ${cells.map((cell) => String(cell || "").trim()).join(" ｜ ")}`;
 }
 
-function padTableCells(cells, previousLine) {
-  const previousCells = parseMarkdownTableRow(previousLine);
-  const targetLength = previousCells ? previousCells.length : cells.length;
+function padTableCells(cells, targetLength) {
   if (cells.length >= targetLength) {
     return cells;
   }
