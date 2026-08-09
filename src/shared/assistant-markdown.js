@@ -83,6 +83,14 @@ function optimizeCardKitMarkdown(text) {
   normalized = downgradeHeadingsForCardKit(normalized);
   normalized = repairMarkdownTables(normalized);
 
+  // 飞书卡片 lark_md 渲染：单 \n 会被压成空格（“显示太紧凑/没换行”）。
+  // 代码块已用 marker 保护，此处只处理正文：
+  //   1) 标题行后的单 \n 升级为段落空行（\n\n），标题不被 <br> 粘连；
+  //   2) 其余单 \n → <br>，强制换行（列表项、伪表格行、逐行输出都逐行显示）；
+  //   3) \n\n 段落分隔保持不变，连续空行压缩。
+  normalized = normalized.replace(/^(#{4,6}[^\n]*)\n/gm, "$1\n\n");
+  normalized = normalized.replace(/([^\n])\n([^\n])/g, "$1<br>$2");
+
   codeBlocks.forEach((block, index) => {
     normalized = normalized.replace(`${marker}${index}___`, `\n\n${block}\n\n`);
   });
