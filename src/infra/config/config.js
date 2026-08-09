@@ -83,6 +83,12 @@ function readConfig() {
     ),
     codexRpcTimeoutMs: readPositiveIntEnv(readCompatEnv("CODEX_IM_CODEX_RPC_TIMEOUT_MS"), 45000),
     codexTurnStartTimeoutMs: readPositiveIntEnv(readCompatEnv("CODEX_IM_CODEX_TURN_START_TIMEOUT_MS"), 300000),
+    // Pi 后端配置（AGENT_BRIDGE_BACKEND=pi 时使用）
+    piCommand: readEnv("AGENT_BRIDGE_PI_COMMAND"),
+    piSessionDir: readEnv("AGENT_BRIDGE_PI_SESSION_DIR"),
+    piProvider: readEnv("AGENT_BRIDGE_PI_PROVIDER"),
+    piTurnTimeoutMs: readPositiveIntEnv("AGENT_BRIDGE_PI_TURN_MS", 900000),
+    piFirstEventTimeoutMs: readPositiveIntEnv("AGENT_BRIDGE_PI_FIRST_EVENT_MS", 60000),
     staleTurnTimeoutMs: readNonNegativeIntEnv(
       readCompatEnv("CODEX_IM_STALE_TURN_TIMEOUT_MS"),
       15 * 60 * 1000

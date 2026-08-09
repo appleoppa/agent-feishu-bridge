@@ -22,6 +22,7 @@
 > | opencode | `AGENT_BRIDGE_BACKEND=opencode`，需 opencode serve 运行 |
 > | Claude Code | `AGENT_BRIDGE_BACKEND=claude`，走 `claude -p stream-json` |
 > | Chuang（创） | `AGENT_BRIDGE_BACKEND=chuang`，走 Chuang app-server Unix socket |
+> | Pi | `AGENT_BRIDGE_BACKEND=pi`，走 `pi --mode rpc`（每轮子进程，流式） |
 
 > 兼容旧变量：`OPENCODE_BRIDGE_BACKEND` / `CHUANG_BRIDGE_BACKEND` / `CLAUDE_BRIDGE_BACKEND`
 > 仍可识别，新部署一律用 `AGENT_BRIDGE_BACKEND`。
@@ -163,7 +164,6 @@ FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxxxxxx
 ```sh
 opencode serve --port 4096          # 先起 opencode serve
 ```
-
 `.env` 里设置：
 
 ```text
@@ -177,6 +177,27 @@ CODEX_IM_DEFAULT_CODEX_EFFORT=medium
 CODEX_IM_DEFAULT_CODEX_ACCESS_MODE=default
 CODEX_IM_ACTIVE_TURN_FOLLOW_UP_MODE=steer
 ```
+
+### Pi 后端
+
+把本机 Pi（[pi-coding-agent](https://github.com/earendil-works/pi-coding-agent)）接进飞书，
+`pi --mode rpc` 每轮子进程 + threadId ↔ Pi session-id 持久化，流式卡片/审批流/群聊只读全部复用：
+
+```text
+AGENT_BRIDGE_BACKEND=pi
+AGENT_BRIDGE_PI_PROVIDER=maoge-dp4        # 对应 pi --provider，默认 maoge-dp4
+AGENT_BRIDGE_PI_COMMAND=/Users/you/.local/bin/pi   # 默认 ~/.local/bin/pi
+AGENT_BRIDGE_DEFAULT_CODEX_MODEL=maoge-dp4
+```
+
+- **模型**：默认走 `AGENT_BRIDGE_PI_PROVIDER`（provider 名）；也可在 `/where` 控制台切模型，
+  `effort` 自动映射为 Pi `--thinking`（ultra→max）。
+- **会话**：一个飞书线程 = 一个 Pi session（`~/.config/agent-bridge/pi-sessions/`），跨轮记忆延续。
+- **审批流**：Pi 的确认请求（`extension_ui_request`）自动转成飞书审批卡，`/approve`、`/reject` 或卡片按钮即回。
+- **群聊安全**：外部群强制只读（`--no-builtin-tools` + 只读工具白名单 + 硬守卫提示）；
+  默认不加载绑定目录 AGENTS.md（飞书外部消息优先安全，`AGENT_BRIDGE_PI_CONTEXT_FILES=1` 可恢复）。
+- **图片**：飞书图片经 base64 传给 Pi 原生图像输入（模型需支持 images，如 sol/gpt-5.6-sol）。
+- **停止**：`/stop` 对应 Pi `abort`。
 
 图片和附件会下载到本机私有缓存，默认位置：
 

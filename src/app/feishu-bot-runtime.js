@@ -15,7 +15,11 @@ const { CodexRpcClient } = AGENT_BRIDGE_BACKEND === "opencode"
     ? require("../infra/chuang/rpc-client")
     : AGENT_BRIDGE_BACKEND === "claude"
       ? require("../infra/claude/rpc-client")
-      : require("../infra/codex/rpc-client");
+      : AGENT_BRIDGE_BACKEND === "pi"
+        ? require("../infra/pi/rpc-client")
+        : require("../infra/codex/rpc-client");
+// Pi 后端的 provider 名单（用于 runtime 内分支判断）
+const IS_PI_BACKEND = AGENT_BRIDGE_BACKEND === "pi";
 const {
   buildCardResponse,
   buildCardToast,
@@ -99,6 +103,12 @@ class FeishuBotRuntime {
       logLevel: config.logLevel,
       requestTimeoutMs: config.codexRpcTimeoutMs,
       turnStartTimeoutMs: config.codexTurnStartTimeoutMs,
+      // Pi 后端专属参数（其余后端忽略）
+      piCommand: config.piCommand,
+      sessionDir: config.piSessionDir,
+      defaultProvider: config.piProvider,
+      turnTimeoutMs: config.piTurnTimeoutMs,
+      firstEventTimeoutMs: config.piFirstEventTimeoutMs,
     });
     this.codexAppServerProfile = config.codexAppServerProfile || "";
     this.lark = null;
@@ -170,7 +180,8 @@ class FeishuBotRuntime {
     if (!String(this.config.defaultCodexModel || "").trim()) {
       throw new Error("AGENT_BRIDGE_DEFAULT_CODEX_MODEL is required");
     }
-    if (!String(this.config.defaultCodexEffort || "").trim()) {
+    // Pi 后端没有 effort 概念（映射到 --thinking），不强制要求 effort 配置
+    if (!IS_PI_BACKEND && !String(this.config.defaultCodexEffort || "").trim()) {
       throw new Error("AGENT_BRIDGE_DEFAULT_CODEX_EFFORT is required");
     }
     if (!String(this.config.defaultCodexAccessMode || "").trim()) {
