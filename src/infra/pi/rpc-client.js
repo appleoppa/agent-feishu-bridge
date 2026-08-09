@@ -236,10 +236,25 @@ class PiRpcClient {
         }
         seen.add(id);
         const stat = fs.statSync(path.join(this.sessionDir, name));
+        // Pi session 文件首行是 {type:"session",...,cwd:"..."}：恢复 cwd，
+        // 让 workspace 过滤能匹配（否则每次桥重启 threadId 被清空 → 上下文断档）。
+        let cwd = "";
+        try {
+          const firstLine = fs.readFileSync(path.join(this.sessionDir, name), "utf8")
+            .split(/\r?\n/, 1)[0];
+          if (firstLine) {
+            const parsed = JSON.parse(firstLine);
+            if (parsed && parsed.type === "session" && typeof parsed.cwd === "string") {
+              cwd = parsed.cwd;
+            }
+          }
+        } catch {
+          // 首行不可解析时保持 cwd 为空
+        }
         threads.push({
           id,
           threadId: id,
-          cwd: "",
+          cwd,
           name: id.slice(0, 8),
           updatedAt: stat.mtimeMs,
           source: "persisted",
