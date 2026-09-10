@@ -1,3 +1,12 @@
+const GPT_5_6_REASONING_EFFORTS = Object.freeze([
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+]);
+
 function extractModelCatalogFromListResponse(response) {
   const candidates = Array.isArray(response?.result?.data)
     ? response.result.data
@@ -53,18 +62,32 @@ function normalizeModelCatalog(models) {
       continue;
     }
     seen.add(dedupeKey);
+    const declaredReasoningEfforts = normalizeReasoningEfforts(
+      model.supportedReasoningEfforts || model.supported_reasoning_efforts
+    );
     normalized.push({
       id,
       model: normalizedModel,
       displayName: normalizeText(model.displayName || model.display_name),
-      supportedReasoningEfforts: normalizeReasoningEfforts(
-        model.supportedReasoningEfforts || model.supported_reasoning_efforts
+      supportedReasoningEfforts: extendReasoningEffortsForModel(
+        normalizedModel,
+        declaredReasoningEfforts
       ),
       defaultReasoningEffort: normalizeText(model.defaultReasoningEffort || model.default_reasoning_effort),
       isDefault: !!(model.isDefault || model.is_default),
     });
   }
   return normalized;
+}
+
+function extendReasoningEffortsForModel(model, efforts) {
+  if (!/^gpt-5\.6(?:$|-)/i.test(normalizeText(model))) {
+    return efforts;
+  }
+  return normalizeReasoningEfforts([
+    ...efforts,
+    ...GPT_5_6_REASONING_EFFORTS,
+  ]);
 }
 
 function normalizeReasoningEfforts(efforts) {

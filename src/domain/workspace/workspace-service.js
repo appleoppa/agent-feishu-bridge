@@ -24,10 +24,47 @@ const {
   inferFeishuFileType,
 } = require("../../shared/media-types");
 const codexMessageUtils = require("../../infra/codex/message-utils");
+const customModelService = require("../custom-model/custom-model-service");
 const { formatFailureText } = require("../../shared/error-text");
 
 const MAX_FEISHU_UPLOAD_FILE_BYTES = 30 * 1024 * 1024;
 const MAX_FEISHU_UPLOAD_IMAGE_BYTES = 10 * 1024 * 1024;
+
+function probeAudioDurationMs(filePath) {
+  return new Promise((resolve) => {
+    const { spawn } = require("child_process");
+    let settled = false;
+    const finish = (value) => {
+      if (!settled) {
+        settled = true;
+        resolve(value);
+      }
+    };
+    const proc = spawn(
+      "ffprobe",
+      [
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        String(filePath),
+      ],
+      { stdio: ["ignore", "pipe", "ignore"] }
+    );
+    let out = "";
+    proc.stdout.on("data", (chunk) => {
+      out += String(chunk);
+    });
+    proc.on("error", () => finish(null));
+    proc.on("close", () => {
+      const seconds = Number((out || "").trim());
+      finish(Number.isFinite(seconds) && seconds > 0 ? Math.round(seconds * 1000) : null);
+    });
+    setTimeout(() => finish(null), 5000);
+  });
+}
 
 async function resolveWorkspaceContext(
   runtime,
@@ -40,11 +77,22 @@ async function resolveWorkspaceContext(
   const replyTarget = runtime.resolveReplyToMessageId(normalized, replyToMessageId);
   const { bindingKey, workspaceRoot } = runtime.getBindingContext(normalized);
   if (!workspaceRoot) {
-    await runtime.sendInfoCardMessage({
-      chatId: normalized.chatId,
-      replyToMessageId: replyTarget,
-      text: missingWorkspaceText,
-    });
+    // 群聊未绑定时 fallback 到群聊默认 workspace（chat-groups）。
+    // 群聊不强制绑定业务项目：用统一的群聊工作区 + AGENTS.md 约束行为，
+    // 避免在群里发绑定卡片（防刷屏、防他人抢占绑定）。
+    if (normalized.chatType === "group") {
+      const groupWorkspace = String(runtime.config?.groupDefaultWorkspace || "").trim();
+      if (groupWorkspace && isWorkspaceAllowed(groupWorkspace, runtime.config.workspaceAllowlist)) {
+        return { bindingKey, workspaceRoot: groupWorkspace, replyTarget };
+      }
+    }
+    if (missingWorkspaceText) {
+      await runtime.sendInfoCardMessage({
+        chatId: normalized.chatId,
+        replyToMessageId: replyTarget,
+        text: missingWorkspaceText,
+      });
+    }
     return null;
   }
 
@@ -52,23 +100,31 @@ async function resolveWorkspaceContext(
 }
 
 async function handleBindCommand(runtime, normalized) {
-  const bindingKey = runtime.sessionStore.buildBindingKey(normalized);
+  const bindingKey = runtime.sessionStore.buildChatBindingKey(normalized);
   const rawWorkspaceRoot = extractBindPath(normalized.text);
   if (!rawWorkspaceRoot) {
     await runtime.sendInfoCardMessage({
       chatId: normalized.chatId,
       replyToMessageId: normalized.messageId,
-      text: "用法: `/codex bind /绝对路径`",
+      text: "用法: `/bind /绝对路径`",
     });
     return;
   }
 
-  const workspaceRoot = normalizeWorkspacePath(rawWorkspaceRoot);
+  const workspaceRoot = resolveBindWorkspacePath(runtime, rawWorkspaceRoot);
+  if (!workspaceRoot) {
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      text: "无法解析项目路径。支持绝对路径，或填写 `AGENT_BRIDGE_PROJECTS_ROOT` 下的文件夹名。",
+    });
+    return;
+  }
   if (!isAbsoluteWorkspacePath(workspaceRoot)) {
     await runtime.sendInfoCardMessage({
       chatId: normalized.chatId,
       replyToMessageId: normalized.messageId,
-      text: "只支持绝对路径绑定。Windows 例如 `C:\\code\\repo`，macOS/Linux 例如 `/Users/name/repo`。",
+      text: "只支持绝对路径绑定，或 `AGENT_BRIDGE_PROJECTS_ROOT` 下的文件夹名。",
     });
     return;
   }
@@ -112,16 +168,121 @@ async function handleBindCommand(runtime, normalized) {
   });
 }
 
+function resolveBindWorkspacePath(runtime, rawWorkspaceRoot) {
+  const raw = String(rawWorkspaceRoot || "").trim();
+  if (!raw) {
+    return "";
+  }
+  const normalized = normalizeWorkspacePath(raw);
+  if (isAbsoluteWorkspacePath(normalized)) {
+    return normalized;
+  }
+  // 相对输入：拼到默认项目根目录
+  const projectsRoot = normalizeWorkspacePath(
+    runtime.config?.defaultProjectsRoot || ""
+  );
+  if (!projectsRoot || raw.includes("/") || raw.includes("\\")) {
+    return "";
+  }
+  return normalizeWorkspacePath(`${projectsRoot}/${raw}`);
+}
+
+async function bindWorkspaceFromForm(runtime, normalized, projectName) {
+  // 群聊里只有管理员能绑定/改绑（防止群里其他人抢占绑定）
+  if (normalized.chatType === "group") {
+    const senderId = String(normalized.senderId || "").trim();
+    const isAdmin = (
+      runtime.groupAdmins && runtime.groupAdmins.isAdmin(normalized.chatId, senderId)
+    ) || (
+      Array.isArray(runtime.config?.adminOpenIds)
+      && runtime.config.adminOpenIds.includes(senderId)
+    );
+    if (!isAdmin) {
+      console.log(`[codex-im] group bind rejected (not admin): chat=${normalized.chatId} sender=${senderId.slice(0, 8)}...`);
+      return; // 静默，不给任何提示
+    }
+  }
+
+  const rawWorkspaceRoot = String(projectName || "").trim();
+  if (!rawWorkspaceRoot) {
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      text: "请填写要绑定的文件夹名。",
+    });
+    return;
+  }
+
+  const bindingKey = runtime.sessionStore.buildChatBindingKey(normalized);
+  const currentWorkspaceRoot = runtime.resolveWorkspaceRootForBinding(bindingKey);
+  const workspaceRoot = resolveBindWorkspacePath(runtime, rawWorkspaceRoot);
+  if (!workspaceRoot || !isAbsoluteWorkspacePath(workspaceRoot)) {
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      text: "无法解析项目路径。请填写 `AGENT_BRIDGE_PROJECTS_ROOT` 下的文件夹名，或绝对路径。",
+    });
+    return;
+  }
+
+  if (currentWorkspaceRoot && currentWorkspaceRoot === workspaceRoot) {
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      text: "该项目已绑定，无需重复操作。",
+    });
+    return;
+  }
+  if (!isWorkspaceAllowed(workspaceRoot, runtime.config.workspaceAllowlist)) {
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      text: "该项目不在允许绑定的白名单中。",
+    });
+    return;
+  }
+
+  const workspaceStats = await runtime.resolveWorkspaceStats(workspaceRoot);
+  if (!workspaceStats.exists) {
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      text: `项目不存在: ${workspaceRoot}`,
+    });
+    return;
+  }
+  if (!workspaceStats.isDirectory) {
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      text: `路径非法: ${workspaceRoot}`,
+    });
+    return;
+  }
+
+  applyDefaultCodexParamsOnBind(runtime, bindingKey, workspaceRoot);
+  runtime.sessionStore.setActiveWorkspaceRoot(bindingKey, workspaceRoot);
+  await runtime.refreshWorkspaceThreads(bindingKey, workspaceRoot, normalized);
+  const existingThreadId = runtime.resolveThreadIdForBinding(bindingKey, workspaceRoot);
+  await showStatusPanel(runtime, normalized, {
+    replyToMessageId: normalized.messageId,
+    noticeText: existingThreadId
+      ? "已绑定项目，并恢复原会话上下文。"
+      : "已绑定项目，可以开始对话了。",
+  });
+}
+
 async function handleWhereCommand(runtime, normalized) {
   await showStatusPanel(runtime, normalized);
 }
 
 async function showStatusPanel(runtime, normalized, { replyToMessageId, noticeText = "" } = {}) {
-  const workspaceContext = await resolveWorkspaceContext(runtime, normalized, { replyToMessageId });
-  if (!workspaceContext) {
+  const replyTarget = runtime.resolveReplyToMessageId(normalized, replyToMessageId);
+  const { bindingKey, workspaceRoot } = runtime.getBindingContext(normalized);
+  if (!workspaceRoot) {
+    await sendWelcomeCard(runtime, normalized, { replyToMessageId: replyTarget });
     return;
   }
-  const { bindingKey, workspaceRoot, replyTarget } = workspaceContext;
 
   const { threads, threadId } = await runtime.resolveWorkspaceThreadState({
     bindingKey,
@@ -138,7 +299,13 @@ async function showStatusPanel(runtime, normalized, { replyToMessageId, noticeTe
   const availableCatalog = runtime.sessionStore.getAvailableModelCatalog();
   const availableModels = Array.isArray(availableCatalog?.models) ? availableCatalog.models : [];
   const modelOptions = buildModelSelectOptions(availableModels);
+  const customModelNames = customModelService.listChannels(runtime).map((channel) => channel.name);
   const effortOptions = buildEffortSelectOptions(availableModels, codexParams?.model || "");
+  const quickCommandOptions = [
+    { label: "📖 /help 帮助", value: "/help" },
+    { label: "🗑️ 清空上下文", value: "/clear" },
+    { label: "🔁 切换项目", value: "/switch_project" },
+  ];
   await runtime.sendInteractiveCard({
     chatId: normalized.chatId,
     replyToMessageId: replyTarget,
@@ -146,6 +313,7 @@ async function showStatusPanel(runtime, normalized, { replyToMessageId, noticeTe
       workspaceRoot,
       codexParams,
       modelOptions,
+      customModelNames,
       effortOptions,
       threadId,
       currentThread,
@@ -153,6 +321,23 @@ async function showStatusPanel(runtime, normalized, { replyToMessageId, noticeTe
       totalThreadCount: threads.length,
       status,
       noticeText,
+      backend: process.env.AGENT_BRIDGE_BACKEND || "",
+      quickCommandOptions,
+    }),
+  });
+}
+
+async function sendWelcomeCard(runtime, normalized, { replyToMessageId = "" } = {}) {
+  const replyTarget = runtime.resolveReplyToMessageId(normalized, replyToMessageId);
+  const projectsRoot = normalizeWorkspacePath(
+    runtime.config?.defaultProjectsRoot || ""
+  ) || "~/projects";
+  await runtime.sendInteractiveCard({
+    chatId: normalized.chatId,
+    replyToMessageId: replyTarget,
+    card: runtime.buildWelcomeCard({
+      backend: process.env.AGENT_BRIDGE_BACKEND || "",
+      projectsRoot,
     }),
   });
 }
@@ -210,7 +395,7 @@ async function handleUnknownCommand(runtime, normalized) {
   await runtime.sendInfoCardMessage({
     chatId: normalized.chatId,
     replyToMessageId: normalized.messageId,
-    text: "无效的 Codex 命令。\n\n可使用 `/codex help` 查看命令教程。",
+    text: "无效的 Codex 命令。\n\n可使用 `/help` 查看命令教程。",
   });
 }
 
@@ -228,7 +413,7 @@ async function handleSendCommand(runtime, normalized) {
     await runtime.sendInfoCardMessage({
       chatId: normalized.chatId,
       replyToMessageId: normalized.messageId,
-      text: "用法: `/codex send <当前项目下的相对文件路径>`",
+      text: "用法: `/send <当前项目下的相对文件路径>`",
     });
     return;
   }
@@ -293,6 +478,8 @@ async function handleSendCommand(runtime, normalized) {
   try {
     const fileBuffer = await fs.promises.readFile(resolvedTarget.filePath);
     const fileType = inferFeishuFileType(resolvedTarget.filePath);
+    const isAudio = attachmentKind === "audio";
+    const duration = isAudio ? await probeAudioDurationMs(resolvedTarget.filePath) : null;
     await runtime.sendLocalAttachmentToFeishu({
       kind: attachmentKind,
       chatId: normalized.chatId,
@@ -300,9 +487,10 @@ async function handleSendCommand(runtime, normalized) {
       fileName: path.basename(resolvedTarget.filePath),
       fileBuffer,
       fileType,
-      msgType: attachmentKind === "audio" ? "audio" : "file",
+      msgType: isAudio ? "audio" : "file",
+      duration,
     });
-    console.log(`[codex-im] attachment/send ok kind=${attachmentKind} workspace=${workspaceRoot} path=${resolvedTarget.displayPath}`);
+    console.log(`[codex-im] attachment/send ok kind=${attachmentKind} durationMs=${duration || "-"} workspace=${workspaceRoot} path=${resolvedTarget.displayPath}`);
   } catch (error) {
     console.warn(
       `[codex-im] attachment/send failed workspace=${workspaceRoot} path=${resolvedTarget.displayPath}: ${error.message}`
@@ -358,7 +546,10 @@ async function handleModelCommand(runtime, normalized) {
     return;
   }
 
-  const resolvedModel = resolveRequestedModel(availableModelsResult.models, rawModel);
+  const customChannel = customModelService.getChannel(runtime, rawModel);
+  const resolvedModel = customChannel
+    ? customChannel.name
+    : resolveRequestedModel(availableModelsResult.models, rawModel);
   if (!resolvedModel) {
     await runtime.sendInfoCardMessage({
       chatId: normalized.chatId,
@@ -376,6 +567,44 @@ async function handleModelCommand(runtime, normalized) {
   await runtime.showStatusPanel(normalized, {
     replyToMessageId: normalized.messageId,
     noticeText: `已设置模型：${resolvedModel}`,
+  });
+}
+
+async function showCustomModelFormCard(runtime, normalized) {
+  await runtime.sendInteractiveCard({
+    chatId: normalized.chatId,
+    replyToMessageId: normalized.messageId,
+    card: runtime.buildCustomModelFormCard({
+      backend: process.env.AGENT_BRIDGE_BACKEND || "",
+    }),
+  });
+}
+
+async function saveCustomModelFromForm(runtime, normalized, formValue = {}) {
+  const result = await customModelService.addChannel(runtime, {
+    name: String(formValue.model_name || "").trim(),
+    baseUrl: String(formValue.model_base_url || "").trim(),
+    apiKey: String(formValue.model_api_key || "").trim(),
+  });
+  if (!result.ok) {
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      text: `❌ 保存失败：${result.error}`,
+      kind: "error",
+    });
+    return;
+  }
+  const maskedKey = customModelService.maskChannelKey(result.channel);
+  await runtime.sendInfoCardMessage({
+    chatId: normalized.chatId,
+    replyToMessageId: normalized.messageId,
+    text: [
+      `✅ 自定义模型「${result.channel.name}」测试通过并已保存。`,
+      `🔑 Key：${maskedKey}`,
+      "",
+      "在 `/where` 控制台的模型下拉里选择它即可切换使用。",
+    ].join("\n"),
   });
 }
 
@@ -413,7 +642,7 @@ async function handleEffortCommand(runtime, normalized) {
     await runtime.sendInfoCardMessage({
       chatId: normalized.chatId,
       replyToMessageId: normalized.messageId,
-      text: "当前无法确定模型，请先执行 `/codex model` 并设置模型后再设置推理强度。",
+      text: "当前无法确定模型，请先执行 `/model` 并设置模型后再设置推理强度。",
     });
     return;
   }
@@ -447,7 +676,7 @@ async function handleWorkspacesCommand(runtime, normalized, { replyToMessageId }
     await runtime.sendInfoCardMessage({
       chatId: normalized.chatId,
       replyToMessageId: replyTarget,
-      text: "当前会话还没有已绑定项目。先发送 `/codex bind /绝对路径`。",
+      text: "当前会话还没有已绑定项目。先发送 `/bind /绝对路径`。",
     });
     return;
   }
@@ -466,7 +695,7 @@ async function showThreadPicker(runtime, normalized, { replyToMessageId } = {}) 
     await runtime.sendInfoCardMessage({
       chatId: normalized.chatId,
       replyToMessageId: replyTarget,
-      text: "当前会话还未绑定项目。先发送 `/codex bind /绝对路径`。",
+      text: "当前会话还未绑定项目。先发送 `/bind /绝对路径`。",
     });
     return;
   }
@@ -499,7 +728,7 @@ async function handleRemoveCommand(runtime, normalized) {
     await runtime.sendInfoCardMessage({
       chatId: normalized.chatId,
       replyToMessageId: normalized.messageId,
-      text: "用法: `/codex remove /绝对路径`",
+      text: "用法: `/remove /绝对路径`",
     });
     return;
   }
@@ -546,7 +775,7 @@ async function switchWorkspaceByPath(runtime, normalized, workspaceRoot, { reply
     await runtime.sendInfoCardMessage({
       chatId: normalized.chatId,
       replyToMessageId: replyToMessageId || normalized.messageId,
-      text: "该项目未绑定到当前会话，请先执行 `/codex bind /绝对路径`。",
+      text: "该项目未绑定到当前会话，请先执行 `/bind /绝对路径`。",
     });
     return;
   }
@@ -604,6 +833,7 @@ async function removeWorkspaceByPath(runtime, normalized, workspaceRoot, { reply
 }
 
 module.exports = {
+  bindWorkspaceFromForm,
   handleBindCommand,
   handleEffortCommand,
   handleHelpCommand,
@@ -613,8 +843,11 @@ module.exports = {
   handleSendCommand,
   handleUnknownCommand,
   handleWhereCommand,
+  showCustomModelFormCard,
+  saveCustomModelFromForm,
   handleWorkspacesCommand,
   removeWorkspaceByPath,
+  sendWelcomeCard,
   resolveWorkspaceContext,
   showStatusPanel,
   showThreadPicker,
@@ -625,7 +858,7 @@ module.exports = {
 function resolveWorkspaceSendTarget(workspaceRoot, requestedPath) {
   const normalizedInput = normalizeWorkspacePath(requestedPath);
   if (!normalizedInput) {
-    return { errorText: "用法: `/codex send <当前项目下的相对文件路径>`" };
+    return { errorText: "用法: `/send <当前项目下的相对文件路径>`" };
   }
   if (isAbsoluteWorkspacePath(normalizedInput)) {
     return { errorText: "只支持当前项目下的相对路径，不支持绝对路径。" };
@@ -701,7 +934,7 @@ function validateDefaultCodexParamsConfig(runtime, modelsInput) {
 async function resolveCodexSettingWorkspaceContext(runtime, normalized) {
   return resolveWorkspaceContext(runtime, normalized, {
     replyToMessageId: normalized.messageId,
-    missingWorkspaceText: "当前会话还未绑定项目。先发送 `/codex bind /绝对路径`。",
+    missingWorkspaceText: "当前会话还未绑定项目。先发送 `/bind /绝对路径`。",
   });
 }
 
@@ -718,7 +951,7 @@ async function loadAvailableModelsForSetting(runtime, normalized, { settingType 
   }
   const isEffort = settingType === "effort";
   const actionLabel = isEffort ? "推理强度" : "模型";
-  const listCommand = isEffort ? "/codex effort" : "/codex model";
+  const listCommand = isEffort ? "/effort" : "/model";
   await runtime.sendInfoCardMessage({
     chatId: normalized.chatId,
     replyToMessageId: normalized.messageId,

@@ -6,7 +6,7 @@ const { isSafeTextFile } = require("../../shared/media-types");
 const MAX_TEXT_PREVIEW_BYTES = 256 * 1024;
 const MAX_TEXT_PREVIEW_CHARS = 12000;
 
-async function prepareAttachmentMessage(runtime, normalized, { workspaceRoot = "", expectedKind = "" } = {}) {
+async function prepareAttachmentMessage(runtime, normalized, { workspaceRoot = "", expectedKind = "", imageMode = "native" } = {}) {
   const pendingAttachments = extractPendingAttachments(normalized, expectedKind);
   if (!pendingAttachments.length) {
     await runtime.sendInfoCardMessage({
@@ -45,6 +45,7 @@ async function prepareAttachmentMessage(runtime, normalized, { workspaceRoot = "
     return buildAttachmentNormalizedMessage({
       normalized,
       downloaded,
+      imageMode,
     });
   } catch (error) {
     await runtime.sendInfoCardMessage({
@@ -146,11 +147,17 @@ async function readTextPreview(filePath) {
     : text;
 }
 
-function buildAttachmentNormalizedMessage({ normalized, downloaded }) {
+function buildAttachmentNormalizedMessage({ normalized, downloaded, imageMode = "native" }) {
   const imageAttachments = downloaded.filter((attachment) => attachment.kind === "image");
   const nonImageAttachments = downloaded.filter((attachment) => attachment.kind !== "image");
+  const isPathMode = imageMode === "path";
+  const taggedDownloaded = downloaded.map((attachment) =>
+    attachment.kind === "image" && isPathMode
+      ? { ...attachment, imageMode: "path" }
+      : attachment
+  );
   const userText = normalizeUserAttachmentText(normalized.text, downloaded);
-  const notes = buildAttachmentSystemNotes(downloaded);
+  const notes = buildAttachmentSystemNotes(taggedDownloaded);
   const text = [userText, "", ...notes].filter(Boolean).join("\n");
 
   return {
@@ -159,9 +166,9 @@ function buildAttachmentNormalizedMessage({ normalized, downloaded }) {
     command: "message",
     attachments: [
       ...preserveNonDownloadedAttachments(normalized.attachments, downloaded),
-      ...downloaded,
+      ...taggedDownloaded,
     ],
-    imageContext: imageAttachments[0]
+    imageContext: !isPathMode && imageAttachments[0]
       ? {
         filePath: imageAttachments[0].filePath,
         size: imageAttachments[0].size,
@@ -176,6 +183,16 @@ function buildAttachmentNormalizedMessage({ normalized, downloaded }) {
 function buildAttachmentSystemNotes(downloaded) {
   return downloaded.map((attachment) => {
     if (attachment.kind === "image") {
+      if (attachment.imageMode === "path") {
+        return [
+          "[System note: A Feishu/Lark user sent an image. The current model has no vision capability, so the bridge did NOT attach it as native image input.]",
+          `Local path: ${attachment.filePath}`,
+          `File name: ${attachment.fileName || path.basename(attachment.filePath)}`,
+          `Size: ${attachment.size} bytes`,
+          `Content type: ${attachment.contentType || "unknown"}`,
+          "Inspect this image with a vision-capable tool using the local path before answering, e.g. run: vision \"<Local path>\" -q \"你要问的问题\"",
+        ].join("\n");
+      }
       return "[System note: A Feishu/Lark user sent an image. The bridge downloaded the original image to local private cache and attached it to this Codex turn as a native image input. Look at the attached image directly; do not treat this note as a replacement for visual inspection.]";
     }
     const lines = [
@@ -201,6 +218,9 @@ function normalizeUserAttachmentText(text, downloaded) {
     return normalized;
   }
   if (downloaded.some((attachment) => attachment.kind === "image")) {
+    if (downloaded.some((attachment) => attachment.kind === "image" && attachment.imageMode === "path")) {
+      return "Inspect the image at the local path in the system notes using a vision tool.";
+    }
     return "Please inspect this image.";
   }
   if (downloaded.some((attachment) => attachment.kind === "audio")) {
@@ -227,6 +247,18 @@ function inferDefaultContentType(attachment) {
   return "application/octet-stream";
 }
 
+function isTextOnlyImageModel(model, patterns) {
+  const name = String(model || "").trim().toLowerCase();
+  if (!name) {
+    return false;
+  }
+  return (Array.isArray(patterns) ? patterns : []).some((pattern) => {
+    const p = String(pattern || "").trim().toLowerCase();
+    return Boolean(p) && (name === p || name.startsWith(p));
+  });
+}
+
 module.exports = {
   prepareAttachmentMessage,
+  isTextOnlyImageModel,
 };

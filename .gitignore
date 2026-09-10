@@ -18,3 +18,6 @@ dist/
 Thumbs.db
 /.idea/
 /sessions.json
+
+# local-only backup dirs
+.bak-*/

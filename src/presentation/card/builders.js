@@ -141,7 +141,7 @@ function buildApprovalCommandPreviewElements(commandPreview) {
   ];
 }
 
-function buildAssistantReplyCard({ text, state, incomingText = "", elapsed = "", model = "", toolText = "", thinkingText = "", usageText = "", contextText = "", toolCountText = "" }) {
+function buildAssistantReplyCard({ text, state, incomingText = "", elapsed = "", model = "", effort = "", toolText = "", thinkingText = "", usageText = "", contextText = "", toolCountText = "" }) {
   const normalizedState = state || "streaming";
   const content = typeof text === "string" && text.trim()
     ? text.trim()
@@ -165,10 +165,20 @@ function buildAssistantReplyCard({ text, state, incomingText = "", elapsed = "",
       : normalizedState === "failed"
         ? "我这次没把它收稳，所以先停在这里。"
         : "我已经把这次回复收好了。";
-  const footer = buildAssistantReplyFooter({
-    status: normalizedState === "failed" ? "未完成" : normalizedState === "completed" ? "已完成" : "正在回复",
+  const footerStatus =
+    normalizedState === "failed" ? "未完成"
+      : normalizedState === "completed" ? "已完成"
+        : "正在回复";
+  const footerStatusEmoji =
+    normalizedState === "failed" ? "🔴"
+      : normalizedState === "completed" ? "✅"
+        : "🟡";
+  const footerElements = buildAssistantReplyFooterElements({
+    status: footerStatus,
+    statusEmoji: footerStatusEmoji,
     elapsed,
     model,
+    effort,
     usageText,
     contextText,
     toolCountText,
@@ -247,17 +257,11 @@ function buildAssistantReplyCard({ text, state, incomingText = "", elapsed = "",
           ],
         },
         {
-          tag: "div",
-          text: {
-            tag: "lark_md",
-            content: sanitizeAssistantMarkdown(content),
-          },
-        },
-        {
           tag: "markdown",
-          content: footer,
-          text_size: "notation",
+          content: sanitizeAssistantMarkdown(content, { preserveHeadings: true }),
+          text_align: "left",
         },
+        ...footerElements,
       ],
     },
   };
@@ -271,22 +275,79 @@ function buildAssistantReplyIntro(incomingText) {
   return `回复：${escapeCardMarkdown(clean.slice(0, 120))}`;
 }
 
-function buildAssistantReplyFooter({ status = "已完成", elapsed = "", model = "", usageText = "", contextText = "", toolCountText = "" }) {
-  const parts = [status];
+function buildAssistantReplyFooterElements({
+  status = "已完成",
+  statusEmoji = "✅",
+  elapsed = "",
+  model = "",
+  effort = "",
+  usageText = "",
+  contextText = "",
+  toolCountText = "",
+}) {
+  const elements = [];
+  const headline = [`${statusEmoji} ${escapeCardMarkdown(status)}`];
+  if (model) {
+    headline.push(escapeCardMarkdown(model));
+  }
   if (elapsed) {
-    parts.push(`耗时 ${escapeCardMarkdown(elapsed)}`);
+    headline.push(`耗时 ${escapeCardMarkdown(elapsed)}`);
+  }
+  if (effort) {
+    headline.push(`强度 ${escapeCardMarkdown(effort)}`);
+  }
+  elements.push({
+    tag: "div",
+    text: { tag: "lark_md", content: headline.join(" · ") },
+  });
+
+  const usage = [];
+  if (usageText) {
+    usage.push(escapeCardMarkdown(usageText));
   }
   if (toolCountText) {
-    parts.push(escapeCardMarkdown(toolCountText));
+    usage.push(escapeCardMarkdown(toolCountText));
   }
-  if (usageText) {
-    parts.push(escapeCardMarkdown(usageText));
+  if (usage.length) {
+    elements.push({
+      tag: "div",
+      text: { tag: "lark_md", content: usage.join(" · ") },
+    });
   }
-  if (contextText) {
-    parts.push(escapeCardMarkdown(contextText));
+
+  const ctx = parseContextTextForProgress(contextText);
+  if (ctx) {
+    elements.push({
+      tag: "progress",
+      mode: "default",
+      value: ctx.pct,
+      color: { tag: "color", color: ctx.pct >= 80 ? "red" : ctx.pct >= 50 ? "yellow" : "green" },
+      text: { tag: "plain_text", content: `${ctx.pct}%` },
+    });
+    const advisory = ctx.advisory ? ` · ${escapeCardMarkdown(ctx.advisory)}` : "";
+    elements.push({
+      tag: "div",
+      text: {
+        tag: "lark_md",
+        content: `上下文 ${ctx.usedText}/${ctx.windowText}${advisory}`,
+      },
+    });
   }
-  parts.push(model ? escapeCardMarkdown(model) : "Codex");
-  return parts.join(" · ");
+  return elements;
+}
+
+function parseContextTextForProgress(contextText) {
+  const text = String(contextText || "").trim();
+  const m = text.match(/^上下文\s+([0-9,.]+)\/([0-9,.]+)\s+\((\d+)%\)(?:\s*·\s*(.*))?$/);
+  if (!m) {
+    return null;
+  }
+  return {
+    usedText: m[1],
+    windowText: m[2],
+    pct: Math.max(0, Math.min(100, Number(m[3]) || 0)),
+    advisory: m[4] || "",
+  };
 }
 
 function buildInfoCard(text, { kind = "info" } = {}) {
@@ -316,10 +377,78 @@ function buildInfoCard(text, { kind = "info" } = {}) {
   };
 }
 
+function resolveAgentMeta(backend) {
+  const normalized = String(backend || process.env.AGENT_BRIDGE_BACKEND || "codex").toLowerCase();
+  const known = {
+    codex: { name: "Codex", icon: "🤖" },
+    opencode: { name: "OpenCode", icon: "⚡" },
+    claude: { name: "Claude", icon: "🧠" },
+    chuang: { name: "Chuang", icon: "🛰️" },
+  };
+  return known[normalized] || { name: normalized || "未知", icon: "❓", unknown: true };
+}
+
+function buildAgentLine(backend) {
+  const meta = resolveAgentMeta(backend);
+  if (meta.unknown) {
+    return `**${meta.icon} 当前智能体**：未识别（标识：${escapeCardMarkdown(meta.name)}）\n仅支持 codex / opencode / claude / chuang`;
+  }
+  return `**${meta.icon} 当前智能体**：${meta.name} 桥`;
+}
+
+function buildWelcomeCard({
+  backend = "",
+  projectsRoot = "~/projects",
+  noticeText = "",
+} = {}) {
+  const elements = [];
+  if (typeof noticeText === "string" && noticeText.trim()) {
+    elements.push({
+      tag: "markdown",
+      content: `✅ ${escapeCardMarkdown(noticeText.trim())}`,
+      text_size: "notation",
+    });
+  }
+
+  elements.push(
+    { tag: "markdown", content: buildAgentLine(backend), text_size: "normal" },
+    {
+      tag: "markdown",
+      content: "这个会话还没有绑定项目。",
+      text_size: "notation",
+    },
+    {
+      tag: "markdown",
+      content: `发送 \`/bind /绝对路径\`（例如 \`/bind ${escapeCardMarkdown(projectsRoot)}/某项目\`）绑定项目后即可开始对话。`,
+      text_size: "notation",
+    },
+    {
+      tag: "markdown",
+      content: "💡 本项目默认工作目录为当前会话绑定的项目；绑定后每次消息都会在对应项目下处理。",
+      text_size: "notation",
+    }
+  );
+
+  return {
+    schema: "2.0",
+    config: {
+      wide_screen_mode: true,
+      update_multi: true,
+      summary: { content: "👋 欢迎使用" },
+    },
+    header: {
+      title: { tag: "plain_text", content: "👋 欢迎使用猫哥的飞书桥（Agent Bridge）" },
+      template: "indigo",
+    },
+    body: { elements },
+  };
+}
+
 function buildStatusPanelCard({
   workspaceRoot,
   codexParams,
   modelOptions,
+  customModelNames = [],
   effortOptions,
   threadId,
   currentThread,
@@ -327,6 +456,8 @@ function buildStatusPanelCard({
   totalThreadCount,
   status,
   noticeText = "",
+  backend = "",
+  quickCommandOptions = [],
 }) {
   const isRunning = status?.code === "running";
   const currentThreadStatusText = status?.code === "running"
@@ -360,26 +491,13 @@ function buildStatusPanelCard({
   }
 
   elements.push({
-      tag: "column_set",
-      flex_mode: "none",
-      columns: [
-        {
-          tag: "column",
-          width: "weighted",
-          weight: 1,
-          vertical_align: "top",
-          elements: [
-            {
-              tag: "markdown",
-              content: [
-                `**当前项目**：\`${escapeCardMarkdown(workspaceRoot)}\``,
-              ].join(""),
-            },
-          ],
-        },
-      ],
-    }
-  );
+    tag: "markdown",
+    content: [
+      buildAgentLine(backend),
+      `**📁 当前项目**：\`${escapeCardMarkdown(workspaceRoot)}\``,
+    ].join("\n"),
+    text_size: "normal",
+  });
   elements.push({
     tag: "column_set",
     flex_mode: "none",
@@ -390,7 +508,7 @@ function buildStatusPanelCard({
         weight: 1,
         vertical_align: "top",
         elements: [
-          buildModelSelectElement(codexParams, modelOptions),
+          buildModelSelectElement(codexParams, modelOptions, customModelNames),
         ],
       },
       {
@@ -404,6 +522,16 @@ function buildStatusPanelCard({
       },
     ],
   });
+
+  const quickOptions = normalizeSelectOptions(quickCommandOptions);
+  if (quickOptions.length) {
+    elements.push({
+      tag: "select_static",
+      placeholder: { tag: "plain_text", content: "⚡ 快捷指令…" },
+      options: quickOptions,
+      value: buildPanelActionValue("quick_command"),
+    });
+  }
   elements.push({ tag: "hr" });
 
   if (threadRows.length) {
@@ -431,27 +559,15 @@ function buildStatusPanelCard({
   }
 
   const footerColumns = [];
-  if (shouldShowAllThreadsButton) {
-    footerColumns.push(buildFooterButtonColumn({
-      text: "全部线程",
-      value: buildPanelActionValue("open_threads"),
-    }));
-  }
   footerColumns.push(buildFooterButtonColumn({
-    text: "新建",
+    text: "➕ 新建线程",
     value: buildPanelActionValue("new_thread"),
+    type: "primary",
   }));
   footerColumns.push(buildFooterButtonColumn({
-    text: "状态",
-    value: buildPanelActionValue("status"),
+    text: "📋 全部线程",
+    value: buildPanelActionValue("open_threads"),
   }));
-  if (isRunning) {
-    footerColumns.push(buildFooterButtonColumn({
-      text: "停止",
-      value: buildPanelActionValue("stop"),
-      type: "danger",
-    }));
-  }
   if (footerColumns.length) {
     elements.push(
       { tag: "hr" },
@@ -530,77 +646,73 @@ function buildHelpCardText() {
     ],
     [
       "**绑定项目**",
-      "`/codex bind /绝对路径`",
-      "把当前飞书会话绑定到一个本地项目。",
+      "`/bind 项目名`",
+      "把当前会话绑定到本地项目，例如 `/bind chuang-agent` 会自动补全为 `~/projects/chuang-agent`；也可以写完整路径 `/bind /home/xxx/项目`。",
     ],
     [
-      "**查看当前状态**",
-      "`/codex where`",
-      "查看当前绑定的项目和正在使用的线程。",
+      "**打开编排控制台**",
+      "`/where`",
+      "打开编排控制台：切换模型、推理强度、快捷指令、新建/查看线程。",
     ],
     [
       "**查看最近消息**",
-      "`/codex message`",
+      "`/message`",
       "查看当前线程最近几轮对话。",
     ],
     [
       "**查看可用历史线程**",
-      "`/codex workspace`",
-      "查看当前项目下 Codex runtime 可见的历史线程。",
-    ],
-    [
-      "**移除会话项目绑定**",
-      "`/codex remove /绝对路径`",
-      "从当前飞书会话中移除指定项目（不能移除当前项目）。",
-    ],
-    [
-      "**发送当前项目内文件**",
-      "`/codex send <相对文件路径>`",
-      "把当前项目内的文件发送到当前飞书会话。",
-    ],
-    [
-      "**切换到指定线程**",
-      "`/codex switch <threadId>`",
-      "按线程 ID 切换到指定线程。",
+      "`/workspace`",
+      "查看当前项目下的历史线程。",
     ],
     [
       "**新建线程**",
-      "`/codex new`",
-      "在当前项目下创建一条新线程并切换过去。",
+      "`/new`",
+      "在当前项目下新建一条线程并切换过去。",
+    ],
+    [
+      "**切换到指定线程**",
+      "`/switch 线程ID`",
+      "按线程 ID 切换线程。",
     ],
     [
       "**中断运行**",
-      "`/codex stop`",
+      "`/stop`",
       "停止当前线程里正在执行的任务。",
     ],
     [
       "**设置模型**",
-      "`/codex model`",
-      "`/codex model update`",
-      "`/codex model <modelId>`",
-      "查看/设置当前项目的模型覆盖。",
+      "`/model`、`/model 模型名`",
+      "查看或设置当前项目使用的模型。",
     ],
     [
       "**设置推理强度**",
-      "`/codex effort`",
-      "`/codex effort <low|medium|high|xhigh>`",
-      "查看/设置当前项目的推理强度覆盖。",
+      "`/effort`、`/effort 强度`",
+      "查看或设置推理强度（低/中/高/极高）。",
     ],
     [
-      "**切换 Codex 运行档**",
-      "`/codex profile`",
-      "`/codex profile main`",
-      "按需切换飞书桥背后的 Codex app-server。",
+      "**发送项目内文件**",
+      "`/send 文件路径`",
+      "把当前项目里的文件发送到会话。",
     ],
     [
-      "**审批命令**",
-      "`/codex approve`\n`/codex approve workspace`\n`/codex reject`",
-      "用于处理 Codex 发起的审批请求。",
+      "**移除会话项目绑定**",
+      "`/remove 项目名`",
+      "移除指定项目的绑定（不能移除当前项目）。",
+    ],
+    [
+      "**审批请求**",
+      "`/approve`、`/reject`",
+      "处理智能体发起的审批请求（通常会以卡片形式弹出）。",
+    ],
+    [
+      "**切换运行档**",
+      "`/profile`、`/profile main`",
+      "切换桥背后的运行档（高级用户）。",
     ],
   ];
 
   return [
-    "**Codex IM 使用说明**",
+    "**猫哥的飞书桥（Agent Bridge）使用说明**",
     sections.map((section) => section.join("\n")).join("\n\n"),
   ].join("\n\n");
 }
@@ -948,6 +1060,55 @@ function formatThreadIdLine(thread) {
   return `线程ID：\`${escapeCardMarkdown(threadId)}\``;
 }
 
+function buildThreadRow({ thread, isCurrent = false, currentThreadStatusText = "" }) {
+  const title = escapeCardMarkdown(formatThreadLabel(thread));
+  const preview = escapeCardMarkdown(summarizeThreadPreview(thread));
+  const threadIdLine = formatThreadIdLine(thread);
+  const statusLine = isCurrent && currentThreadStatusText
+    ? `状态：${escapeCardMarkdown(currentThreadStatusText)}`
+    : "";
+  const actionText = isCurrent ? "当前" : "切换";
+  const actionType = isCurrent ? "default" : "primary";
+
+  return {
+    tag: "column_set",
+    flex_mode: "none",
+    columns: [
+      {
+        tag: "column",
+        width: "weighted",
+        weight: 1,
+        vertical_align: "center",
+        elements: [
+          {
+            tag: "markdown",
+            content: [
+              `**${title}**`,
+              preview,
+              threadIdLine,
+              statusLine,
+            ].filter(Boolean).join("\n"),
+            text_size: "notation",
+          },
+        ],
+      },
+      {
+        tag: "column",
+        width: "auto",
+        vertical_align: "center",
+        elements: [
+          {
+            tag: "button",
+            text: { tag: "plain_text", content: actionText },
+            type: actionType,
+            value: buildThreadActionValue("switch", normalizeIdentifier(thread?.id)),
+          },
+        ],
+      },
+    ],
+  };
+}
+
 function truncateDisplayText(text, maxLength) {
   const input = String(text || "");
   const chars = Array.from(input);
@@ -997,16 +1158,41 @@ function buildFormSubmitButton({ name, text, value, type = "" }) {
   return button;
 }
 
-function buildModelSelectElement(codexParams, modelOptions) {
-  const options = normalizeSelectOptions(modelOptions);
-  if (!options.length) {
-    return {
-      tag: "markdown",
-      content: "暂无可用模型（等待启动同步或执行 `/codex model update`）",
-      text_size: "notation",
-    };
+const CUSTOM_MODEL_ADD_OPTION_VALUE = "__add_custom_model__";
+
+function buildModelSelectElement(codexParams, modelOptions, customModelNames = []) {
+  const normalizedCustomNames = Array.isArray(customModelNames)
+    ? customModelNames.map((name) => String(name || "").trim()).filter(Boolean)
+    : [];
+  const rawOptions = [];
+  const seen = new Set();
+  // 「✏️ 添加自定义模型」放在最前面，保证入口显眼且不被任何截断逻辑隐藏。
+  rawOptions.push({
+    label: "✏️ 添加自定义模型",
+    value: CUSTOM_MODEL_ADD_OPTION_VALUE,
+  });
+  seen.add(CUSTOM_MODEL_ADD_OPTION_VALUE);
+  for (const option of Array.isArray(modelOptions) ? modelOptions : []) {
+    const label = String(option?.label || option?.value || "").trim();
+    const value = String(option.value || "").trim();
+    if (!label || !value || seen.has(value)) {
+      continue;
+    }
+    seen.add(value);
+    rawOptions.push({ label, value });
+  }
+  for (const name of normalizedCustomNames) {
+    if (seen.has(name)) {
+      continue;
+    }
+    seen.add(name);
+    rawOptions.push({ label: `✏️ ${name}`, value: name });
   }
   const selectedValue = String(codexParams?.model || "").trim();
+  if (selectedValue && !seen.has(selectedValue) && normalizedCustomNames.includes(selectedValue)) {
+    rawOptions.push({ label: `✏️ ${selectedValue}`, value: selectedValue });
+  }
+  const options = normalizeSelectOptions(rawOptions);
   const initialOption = findOptionByValue(options, selectedValue);
   return {
     tag: "select_static",
@@ -1017,6 +1203,73 @@ function buildModelSelectElement(codexParams, modelOptions) {
     options,
     initial_option: initialOption?.value || undefined,
     value: buildPanelActionValue("set_model"),
+  };
+}
+
+function buildCustomModelFormCard({ backend = "" } = {}) {
+  const elements = [];
+  elements.push({
+    tag: "markdown",
+    content: [
+      "添加一个新的模型通道：填写 API 地址、模型名和 API Key，",
+      "**测试通过后才会保存**，保存后可在模型下拉里直接切换使用。",
+    ].join(""),
+    text_size: "normal",
+  });
+  elements.push({
+    tag: "form_container",
+    name: "custom_model_form",
+    elements: [
+      {
+        tag: "input",
+        name: "model_base_url",
+        placeholder: {
+          tag: "plain_text",
+          content: "API 地址，如 https://5yuantoken.org/v1",
+        },
+      },
+      {
+        tag: "input",
+        name: "model_name",
+        placeholder: {
+          tag: "plain_text",
+          content: "模型名，如 deepseek-v4-flash",
+        },
+      },
+      {
+        tag: "input",
+        name: "model_api_key",
+        is_password: true,
+        placeholder: {
+          tag: "plain_text",
+          content: "API Key（不会显示在卡片和日志中）",
+        },
+      },
+      buildFormSubmitButton({
+        name: "submit_custom_model",
+        text: "🧪 测试并保存",
+        value: { kind: "form", action: "add_custom_model_save" },
+        type: "primary",
+      }),
+    ],
+  });
+  elements.push({
+    tag: "markdown",
+    content: "🔒 API Key 只会保存到本机配置文件（权限 600），不会出现在卡片、日志或代码仓库。",
+    text_size: "notation",
+  });
+  return {
+    schema: "2.0",
+    config: {
+      wide_screen_mode: true,
+      update_multi: true,
+      summary: { content: "✏️ 添加自定义模型" },
+    },
+    header: {
+      title: { tag: "plain_text", content: "✏️ 添加自定义模型" },
+      template: "indigo",
+    },
+    body: { elements },
   };
 }
 
@@ -1160,9 +1413,9 @@ function buildModelInfoText(workspaceRoot, current, availableModelsResult) {
     ...modelLines,
     "",
     "用法：",
-    "`/codex model`",
-    "`/codex model update`",
-    "`/codex model <modelId>`",
+    "`/model`",
+    "`/model update`",
+    "`/model <modelId>`",
     canLoadModels ? "" : "提示：当前无法拉取模型列表，设置模型会被拒绝。",
   ].join("\n");
 }
@@ -1183,9 +1436,9 @@ function buildEffortInfoText(workspaceRoot, current, availableModelsResult) {
     ...effortLines,
     "",
     "用法：",
-    "`/codex effort`",
-    "`/codex model update`",
-    "`/codex effort <low|medium|high|xhigh>`",
+    "`/effort`",
+    "`/model update`",
+    "`/effort <low|medium|high|xhigh|max|ultra>`",
   ].join("\n");
 }
 
@@ -1198,7 +1451,7 @@ function buildModelListText(workspaceRoot, availableModelsResult, { refreshed = 
     "**可用模型**",
   ];
   lines.push(...buildAvailableModelLines(availableModelsResult, { limit: 60 }));
-  lines.push("", "用法：", "`/codex model update`", "`/codex model <modelId>`");
+  lines.push("", "用法：", "`/model update`", "`/model <modelId>`");
   return lines.join("\n");
 }
 
@@ -1215,7 +1468,7 @@ function buildModelValidationErrorText(workspaceRoot, rawModel, models) {
       lines.push(`- \`${item.model}\``);
     }
   }
-  lines.push("", "请执行 `/codex model` 查看可用模型。");
+  lines.push("", "请执行 `/model` 查看可用模型。");
   return lines.join("\n");
 }
 
@@ -1234,9 +1487,9 @@ function buildEffortListText(workspaceRoot, current, availableModelsResult, { re
     ...buildAvailableEffortLines(effectiveModel, availableModelsResult),
     "",
     "用法：",
-    "`/codex effort`",
-    "`/codex model update`",
-    "`/codex effort <low|medium|high|xhigh>`",
+    "`/effort`",
+    "`/model update`",
+    "`/effort <low|medium|high|xhigh|max|ultra>`",
   ];
   return lines.join("\n");
 }
@@ -1252,7 +1505,7 @@ function buildEffortValidationErrorText(workspaceRoot, modelEntry, rawEffort) {
     "可用推理强度：",
     ...supportedLines,
     "",
-    "请执行 `/codex effort` 查看可用推理强度。",
+    "请执行 `/effort` 查看可用推理强度。",
   ].join("\n");
 }
 
@@ -1271,7 +1524,7 @@ function buildAvailableModelLines(availableModelsResult, { limit = 10 } = {}) {
     lines.push(`- \`${item.model}\``);
   }
   if (models.length > display.length) {
-    lines.push(`- ... 还有 ${models.length - display.length} 个，执行 \`/codex model\` 查看全部`);
+    lines.push(`- ... 还有 ${models.length - display.length} 个，执行 \`/model\` 查看全部`);
   }
   return lines;
 }
@@ -1363,12 +1616,17 @@ module.exports = {
   buildModelListText,
   buildModelValidationErrorText,
   buildStatusPanelCard,
+  buildCustomModelFormCard,
   buildEffortInfoText,
   buildEffortListText,
   buildEffortValidationErrorText,
   buildThreadMessagesSummary,
   buildThreadPickerCard,
   buildWorkspaceBindingsCard,
+  buildWelcomeCard,
+  resolveAgentMeta,
   listBoundWorkspaces,
+  buildAssistantReplyFooterElements,
+  parseContextTextForProgress,
   mergeReplyText,
 };

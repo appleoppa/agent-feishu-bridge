@@ -152,9 +152,20 @@ function cleanupThreadRuntimeState(runtime, threadId) {
   runtime.pendingApprovalByThreadId.delete(threadId);
   runtime.activeTurnIdByThreadId.delete(threadId);
   runtime.activeTurnStartedAtByThreadId.delete(threadId);
+  if (runtime.turnSteerQueueByThreadId instanceof Map) {
+    runtime.turnSteerQueueByThreadId.delete(threadId);
+  }
   runtime.pendingChatContextByThreadId.delete(threadId);
   runtime.bindingKeyByThreadId.delete(threadId);
   runtime.workspaceRootByThreadId.delete(threadId);
+  if (runtime.turnFailureTextByRunKey instanceof Map) {
+    const prefix = `${threadId}:`;
+    for (const runKey of runtime.turnFailureTextByRunKey.keys()) {
+      if (runKey.startsWith(prefix)) {
+        runtime.turnFailureTextByRunKey.delete(runKey);
+      }
+    }
+  }
 
   for (const [runKey, entry] of runtime.replyCardByRunKey.entries()) {
     if (entry?.threadId === threadId) {
@@ -167,6 +178,8 @@ function pruneRuntimeMapSizes(runtime) {
   pruneMapToLimit(runtime.activeTurnIdByThreadId, MAX_THREAD_CONTEXT_CACHE_ENTRIES);
   pruneMapToLimit(runtime.activeTurnStartedAtByThreadId, MAX_THREAD_CONTEXT_CACHE_ENTRIES);
   pruneMapToLimit(runtime.currentRunKeyByThreadId, MAX_THREAD_CONTEXT_CACHE_ENTRIES);
+  pruneMapToLimit(runtime.turnFailureTextByRunKey, MAX_THREAD_CONTEXT_CACHE_ENTRIES);
+  pruneMapToLimit(runtime.reasoningTraceByRunKey, MAX_THREAD_CONTEXT_CACHE_ENTRIES);
   pruneSetToLimit(runtime.sentAttachmentDirectiveKeys, MAX_THREAD_CONTEXT_CACHE_ENTRIES);
 }
 

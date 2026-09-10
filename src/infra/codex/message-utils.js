@@ -30,6 +30,7 @@ function mapCodexMessageToImEvent(message, options = {}) {
   const threadId = extractThreadIdentifier(params);
   const turnId = extractTurnIdentifier(params);
   const suppressCompletedAssistantText = Boolean(options.suppressCompletedAssistantText);
+  const terminalFailureText = normalizeIdentifier(options.terminalFailureText);
 
   if (isAssistantMessageMethod(method, params)) {
     const text = extractAssistantText(method, params);
@@ -61,7 +62,10 @@ function mapCodexMessageToImEvent(message, options = {}) {
 
   if (method === "turn/completed") {
     const turnStatus = normalizeIdentifier(params?.turn?.status).toLowerCase();
-    const isFailed = turnStatus === "failed" || !!params?.turn?.error || !!params?.error;
+    const isFailed = turnStatus === "failed"
+      || !!params?.turn?.error
+      || !!params?.error
+      || !!terminalFailureText;
     if (isFailed) {
       return {
         type: "im.run_state",
@@ -69,7 +73,7 @@ function mapCodexMessageToImEvent(message, options = {}) {
           threadId,
           turnId,
           state: "failed",
-          text: extractTurnFailureText(params),
+          text: terminalFailureText || extractTurnFailureText(params),
         },
       };
     }
@@ -91,6 +95,17 @@ function mapCodexMessageToImEvent(message, options = {}) {
         turnId,
         state: "failed",
         text: extractTurnFailureText(params),
+      },
+    };
+  }
+
+  if (method === "turn/cancelled") {
+    return {
+      type: "im.run_state",
+      payload: {
+        threadId,
+        turnId,
+        state: "cancelled",
       },
     };
   }
@@ -411,7 +426,7 @@ function isCommandApprovalMethod(method) {
 function isWorkspaceApprovalCommand(rawText) {
   const normalizedText = typeof rawText === "string" ? rawText.trim().toLowerCase() : "";
   return (
-    normalizedText === "/codex approve workspace"
+    normalizedText === "/opencode approve workspace"
     || normalizedText.endsWith(" approve workspace")
   );
 }
@@ -645,6 +660,7 @@ module.exports = {
   buildRunKey,
   eventShouldClearPendingReaction,
   extractCreatedMessageId,
+  extractCodexErrorText,
   extractThreadId,
   extractThreadListCursor,
   extractThreadsFromListResponse,

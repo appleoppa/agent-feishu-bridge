@@ -11,7 +11,7 @@ function sanitizeAssistantMarkdown(text, options = {}) {
     .replace(THINK_TAG_RE, "")
     .replace(DANGEROUS_HTML_TAG_RE, "")
     .replace(DANGEROUS_LINK_RE, "$1about:blank$3")
-    .replace(/\n{3,}/g, "\n\n");
+    .replace(/\n{4,}/g, "\n\n\n");
 
   if (!preserveHeadings) {
     normalized = normalized.replace(/^\s{0,3}#{1,6}\s+(.+)$/gm, (_, title) => `**${String(title).trim()}**`);
@@ -83,11 +83,20 @@ function optimizeCardKitMarkdown(text) {
   normalized = downgradeHeadingsForCardKit(normalized);
   normalized = repairMarkdownTables(normalized);
 
+  // 飞书卡片 lark_md 渲染：单 \n 与 <br> 均会被压成空格（“显示太紧凑/没换行”），
+  // 仅空行分段（\n\n）在卡片内有效（用户实测：段落式卡片显示正常）。
+  // 代码块已用 marker 保护，此处只处理正文：
+  //   1) 标题行后的单 \n 升级为段落空行（\n\n）；
+  //   2) 其余单 \n → \n\n（段落化：列表项、伪表格行、逐行输出都逐行成段显示）；
+  //   3) 已有 \n\n 段落分隔保持不变，连续空行压缩。
+  normalized = normalized.replace(/^(#{4,6}[^\n]*)\n/gm, "$1\n\n");
+  normalized = normalized.replace(/([^\n])\n([^\n])/g, "$1\n\n$2");
+
   codeBlocks.forEach((block, index) => {
     normalized = normalized.replace(`${marker}${index}___`, `\n\n${block}\n\n`);
   });
 
-  return normalized.replace(/\n{3,}/g, "\n\n").trim();
+  return normalized.replace(/\n{4,}/g, "\n\n\n").trim();
 }
 
 function downgradeHeadingsForCardKit(text) {
@@ -100,29 +109,36 @@ function downgradeHeadingsForCardKit(text) {
 }
 
 function repairMarkdownTables(text) {
+  // 飞书卡片 lark_md 不支持 GFM 表格语法（竖线行渲染不成表格），
+  // 因此把 markdown 表格块转成 lark_md 可渲染的形式：
+  //   表头行 → **单元格1 ｜ 单元格2**（加粗）
+  //   数据行 → - 单元格1 ｜ 单元格2（无序列表）
+  //   分隔行 → 丢弃
+  // 分隔符用全角竖线（｜），避免与 markdown 列表/竖线语法冲突。
   const lines = String(text || "").split("\n");
   const output = [];
   let previousWasTable = false;
+  let tableColumnCount = 0;
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
     const headerCells = parseMarkdownTableRow(line);
     const nextLine = lines[index + 1] || "";
 
-    if (headerCells && headerCells.length >= 2 && looksLikeTableSeparator(nextLine)) {
+    if (headerCells && headerCells.length >= 1 && looksLikeTableSeparator(nextLine)) {
       if (output.length && output[output.length - 1].trim() && !previousWasTable) {
         output.push("");
       }
-      output.push(formatMarkdownTableRow(headerCells));
-      output.push(formatMarkdownTableSeparator(headerCells.length));
+      tableColumnCount = headerCells.length;
+      output.push(formatTableHeaderLine(headerCells));
       previousWasTable = true;
       index += 1;
       continue;
     }
 
     const rowCells = previousWasTable ? parseLooseMarkdownTableRow(line) : null;
-    if (rowCells && rowCells.length >= 2) {
-      output.push(formatMarkdownTableRow(padTableCells(rowCells, output[output.length - 1])));
+    if (rowCells && rowCells.length >= 1) {
+      output.push(formatTableDataLine(padTableCells(rowCells, tableColumnCount)));
       previousWasTable = true;
       continue;
     }
@@ -132,6 +148,7 @@ function repairMarkdownTables(text) {
     }
     output.push(line);
     previousWasTable = false;
+    tableColumnCount = 0;
   }
 
   return output.join("\n");
@@ -142,8 +159,13 @@ function parseMarkdownTableRow(line) {
   if (!trimmed.startsWith("|") || !trimmed.endsWith("|")) {
     return null;
   }
-  const cells = trimmed.slice(1, -1).split("|").map((cell) => cell.trim());
-  return cells.length >= 2 ? cells : null;
+  // 先保护转义竖线（\|），切分后再还原，避免单元格内容被拆开
+  const protectedText = trimmed.replace(/\\\|/g, "\u0001");
+  const cells = protectedText
+    .slice(1, -1)
+    .split("|")
+    .map((cell) => String(cell || "").trim().replace(/\u0001/g, "|"));
+  return cells.length >= 1 ? cells : null;
 }
 
 function parseLooseMarkdownTableRow(line) {
@@ -168,17 +190,15 @@ function looksLikeTableSeparator(line) {
   return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
 }
 
-function formatMarkdownTableRow(cells) {
-  return `| ${cells.map((cell) => String(cell || "").trim()).join(" | ")} |`;
+function formatTableHeaderLine(cells) {
+  return `**${cells.map((cell) => String(cell || "").trim()).join(" ｜ ")}**`;
 }
 
-function formatMarkdownTableSeparator(count) {
-  return `| ${Array.from({ length: Math.max(2, count) }, () => "---").join(" | ")} |`;
+function formatTableDataLine(cells) {
+  return `- ${cells.map((cell) => String(cell || "").trim()).join(" ｜ ")}`;
 }
 
-function padTableCells(cells, previousLine) {
-  const previousCells = parseMarkdownTableRow(previousLine);
-  const targetLength = previousCells ? previousCells.length : cells.length;
+function padTableCells(cells, targetLength) {
   if (cells.length >= targetLength) {
     return cells;
   }

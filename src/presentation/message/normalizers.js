@@ -16,7 +16,12 @@ function normalizeFeishuTextEvent(event, config) {
     return normalizeFeishuNonTextEvent(message, sender, config);
   }
 
-  const text = parseFeishuMessageText(message.content);
+  const rawText = parseFeishuMessageText(message.content);
+  if (!rawText) {
+    return null;
+  }
+  const mentions = extractFeishuMentions(message);
+  const text = replaceMentionKeysInText(rawText, mentions);
   if (!text) {
     return null;
   }
@@ -27,11 +32,52 @@ function normalizeFeishuTextEvent(event, config) {
     chatId: message.chat_id || "",
     threadKey: message.root_id || "",
     senderId: sender?.sender_id?.open_id || sender?.sender_id?.user_id || "",
+    chatType: normalizeIdentifier(message.chat_type),
+    mentions,
     messageId: message.message_id || "",
     text,
     command: parseCommand(text),
     receivedAt: new Date().toISOString(),
   };
+}
+
+function extractFeishuMentions(message) {
+  const raw = Array.isArray(message?.mentions) ? message.mentions : [];
+  const mentions = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
+    const key = normalizeIdentifier(entry.key);
+    if (!key) {
+      continue;
+    }
+    mentions.push({
+      key,
+      openId: normalizeIdentifier(entry.id?.open_id),
+      userId: normalizeIdentifier(entry.id?.user_id),
+      name: normalizeIdentifier(entry.name),
+    });
+  }
+  return mentions;
+}
+
+function replaceMentionKeysInText(text, mentions) {
+  if (!Array.isArray(mentions) || !mentions.length) {
+    return typeof text === "string" ? text : "";
+  }
+  let result = String(text || "");
+  for (const mention of mentions) {
+    const key = String(mention.key || "").trim();
+    if (!key) {
+      continue;
+    }
+    const displayName = mention.name
+      ? `@${mention.name}`
+      : key;
+    result = result.split(key).join(displayName);
+  }
+  return result;
 }
 
 function normalizeFeishuNonTextEvent(message, sender, config) {
@@ -54,6 +100,8 @@ function normalizeFeishuNonTextEvent(message, sender, config) {
     chatId: message.chat_id || "",
     threadKey: message.root_id || "",
     senderId: sender?.sender_id?.open_id || sender?.sender_id?.user_id || "",
+    chatType: normalizeIdentifier(message.chat_type),
+    mentions: extractFeishuMentions(message),
     messageId: message.message_id || "",
     text,
     command,
@@ -105,7 +153,26 @@ function extractCardAction(data) {
       workspaceRoot: value.workspaceRoot || "",
     };
   }
+  if (value.kind === "form") {
+    return {
+      kind: value.kind,
+      action: value.action || "",
+      formValue: extractCardFormValue(action),
+    };
+  }
   return null;
+}
+
+function extractCardFormValue(action) {
+  const raw = action?.form_value || action?.formValue || {};
+  if (!raw || typeof raw !== "object") {
+    return {};
+  }
+  const result = {};
+  for (const [key, val] of Object.entries(raw)) {
+    result[key] = typeof val === "string" ? val.trim() : val;
+  }
+  return result;
 }
 
 function normalizeCardActionContext(data, config) {
@@ -418,8 +485,9 @@ function dedupeStrings(values) {
 
 function parseCommand(text) {
   const normalized = text.trim().toLowerCase();
-  const prefixes = ["/codex "];
-  const exactPrefixes = ["/codex"];
+
+  // 命令前缀：通用 / 前缀优先（/bind 等），兼容旧用户 /codex、/claude、/opencode
+  const COMMAND_PREFIXES = ["/codex", "/claude", "/opencode", "/"];
 
   const exactCommands = {
     stop: ["stop"],
@@ -438,37 +506,41 @@ function parseCommand(text) {
   };
 
   for (const [command, suffixes] of Object.entries(exactCommands)) {
-    if (matchesExactCommand(normalized, suffixes)) {
-      return command;
+    for (const prefix of COMMAND_PREFIXES) {
+      if (matchesExactCommand(normalized, suffixes, prefix)) {
+        return command;
+      }
     }
   }
 
-  if (matchesPrefixCommand(normalized, "switch")) {
-    return "switch";
+  for (const prefix of COMMAND_PREFIXES) {
+    if (matchesPrefixCommand(normalized, "switch", prefix)) {
+      return "switch";
+    }
+    if (matchesPrefixCommand(normalized, "remove", prefix)) {
+      return "remove";
+    }
+    if (matchesPrefixCommand(normalized, "send", prefix)) {
+      return "send";
+    }
+    if (matchesPrefixCommand(normalized, "bind", prefix)) {
+      return "bind";
+    }
+    if (matchesPrefixCommand(normalized, "model", prefix)) {
+      return "model";
+    }
+    if (matchesPrefixCommand(normalized, "effort", prefix)) {
+      return "effort";
+    }
+    if (matchesPrefixCommand(normalized, "profile", prefix)) {
+      return "profile";
+    }
   }
-  if (matchesPrefixCommand(normalized, "remove")) {
-    return "remove";
-  }
-  if (matchesPrefixCommand(normalized, "send")) {
-    return "send";
-  }
-  if (matchesPrefixCommand(normalized, "bind")) {
-    return "bind";
-  }
-  if (matchesPrefixCommand(normalized, "model")) {
-    return "model";
-  }
-  if (matchesPrefixCommand(normalized, "effort")) {
-    return "effort";
-  }
-  if (matchesPrefixCommand(normalized, "profile")) {
-    return "profile";
-  }
-  if (prefixes.some((prefix) => normalized.startsWith(prefix))) {
-    return "unknown_command";
-  }
-  if (exactPrefixes.includes(normalized)) {
-    return "unknown_command";
+
+  for (const prefix of COMMAND_PREFIXES) {
+    if (normalized.startsWith(`${prefix} `) || normalized === prefix) {
+      return "unknown_command";
+    }
   }
   if (text.trim()) {
     return "message";
@@ -477,16 +549,26 @@ function parseCommand(text) {
   return "";
 }
 
-function matchesExactCommand(text, suffixes) {
-  return suffixes.some((suffix) => text === `/codex ${suffix}`);
+function matchesExactCommand(text, suffixes, prefix) {
+  return suffixes.some((suffix) => {
+    // 通用前缀 "/" 直接拼接（/approve），带名前缀需要空格（/codex approve）
+    const full = prefix === "/" ? `${prefix}${suffix}` : `${prefix} ${suffix}`;
+    return text === full;
+  });
 }
 
-function matchesPrefixCommand(text, command) {
-  return text.startsWith(`/codex ${command} `);
+function matchesPrefixCommand(text, command, prefix) {
+  const full = prefix === "/" ? `${prefix}${command} ` : `${prefix} ${command} `;
+  return text.startsWith(full);
 }
 
 function extractCardChatId(data) {
-  return normalizeIdentifier(data?.context?.open_chat_id);
+  return normalizeIdentifier(
+    data?.context?.open_chat_id
+    || data?.message?.chat_id
+    || data?.chat_id
+    || data?.event?.message?.chat_id
+  );
 }
 
 function extractCardSelectedValue(action, value) {
@@ -503,6 +585,19 @@ function normalizeIdentifier(value) {
   return typeof value === "string" && value.trim() ? value.trim() : "";
 }
 
+function extractCardOperatorSenderId(data) {
+  return normalizeIdentifier(data?.operator?.open_id || data?.operator?.user_id);
+}
+
+function extractCardOperatorSenderIds(data) {
+  const openId = normalizeIdentifier(data?.operator?.open_id);
+  const userId = normalizeIdentifier(data?.operator?.user_id);
+  const ids = [];
+  if (openId) ids.push(openId);
+  if (userId && userId !== openId) ids.push(userId);
+  return ids;
+}
+
 function normalizeNumber(value) {
   const number = Number(value || 0);
   return Number.isFinite(number) && number > 0 ? number : 0;
@@ -510,7 +605,10 @@ function normalizeNumber(value) {
 
 module.exports = {
   extractCardAction,
+  extractCardOperatorSenderId,
+  extractCardOperatorSenderIds,
   mapCodexMessageToImEvent,
   normalizeCardActionContext,
   normalizeFeishuTextEvent,
+  parseCommand,
 };

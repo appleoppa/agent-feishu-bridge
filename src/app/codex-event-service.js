@@ -2,10 +2,22 @@ const codexMessageUtils = require("../infra/codex/message-utils");
 const attachmentDirectives = require("../domain/attachments/outbound-directive-service");
 const { formatFailureText } = require("../shared/error-text");
 
+const MAX_TURN_FAILURE_CACHE_ENTRIES = 500;
+
 async function handleStopCommand(runtime, normalized) {
   const { bindingKey, workspaceRoot } = runtime.getBindingContext(normalized);
   const threadId = workspaceRoot ? runtime.resolveThreadIdForBinding(bindingKey, workspaceRoot) : null;
   const turnId = threadId ? runtime.activeTurnIdByThreadId.get(threadId) || null : null;
+
+  if (threadId && String(turnId || "").startsWith("custom-turn-")) {
+    runtime.cleanupThreadRuntimeState(threadId);
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      text: "自定义模型暂不支持主动中断，已清理飞书端运行状态；回复可能仍在后台继续生成。",
+    });
+    return;
+  }
 
   if (!threadId) {
     await runtime.sendInfoCardMessage({
@@ -32,29 +44,37 @@ async function handleStopCommand(runtime, normalized) {
     await runtime.sendInfoCardMessage({
       chatId: normalized.chatId,
       replyToMessageId: normalized.messageId,
-      text: `${formatFailureText("停止请求未确认", error)}\n\n我已先清理飞书端运行状态，你可以继续发消息；如果终端侧仍在跑，建议稍后再发一次 /codex stop。`,
+      text: `${formatFailureText("停止请求未确认", error)}\n\n我已先清理飞书端运行状态，你可以继续发消息；如果终端侧仍在跑，建议稍后再发一次 /stop。`,
     });
   }
 }
 
 function handleCodexMessage(runtime, message) {
-  if (typeof message?.method === "string") {
+  if (runtime.config.logLevel === "verbose" && typeof message?.method === "string") {
     console.log(`[codex-im] codex event ${message.method}`);
   }
-  codexMessageUtils.trackAssistantDeltaReceipt(runtime.assistantDeltaSeenByRunKey, message);
-  trackLatestTokenUsage(runtime, message);
-  trackLatestToolUsage(runtime, message);
-  codexMessageUtils.trackRunningTurn(runtime.activeTurnIdByThreadId, message);
-  trackRunningTurnStartedAt(runtime, message);
-  codexMessageUtils.trackPendingApproval(runtime.pendingApprovalByThreadId, message);
-  codexMessageUtils.trackRunKeyState(runtime.currentRunKeyByThreadId, runtime.activeTurnIdByThreadId, message);
-  runtime.pruneRuntimeMapSizes();
+
+  rememberTerminalError(runtime, message);
   const outbound = codexMessageUtils.mapCodexMessageToImEvent(message, {
     suppressCompletedAssistantText: codexMessageUtils.shouldSuppressCompletedAssistantText(
       runtime.assistantDeltaSeenByRunKey,
       message
     ),
+    terminalFailureText: getRememberedTerminalError(runtime, message),
   });
+
+  codexMessageUtils.trackAssistantDeltaReceipt(runtime.assistantDeltaSeenByRunKey, message);
+  trackLatestTokenUsage(runtime, message);
+  const toolUsageChanged = trackLatestToolUsage(runtime, message);
+  const reasoningTraceChanged = trackLatestReasoningSummary(runtime, message);
+  codexMessageUtils.trackRunKeyState(runtime.currentRunKeyByThreadId, runtime.activeTurnIdByThreadId, message);
+  codexMessageUtils.trackRunningTurn(runtime.activeTurnIdByThreadId, message);
+  trackRunningTurnStartedAt(runtime, message);
+  codexMessageUtils.trackPendingApproval(runtime.pendingApprovalByThreadId, message);
+  runtime.pruneRuntimeMapSizes();
+  if (toolUsageChanged || reasoningTraceChanged) {
+    refreshStreamingReplyCardForProgress(runtime, message);
+  }
   if (!outbound) {
     return;
   }
@@ -84,11 +104,69 @@ function handleCodexMessage(runtime, message) {
       if (!shouldCleanupThreadState || !threadId) {
         return;
       }
+      forgetTerminalError(runtime, message);
       runtime.clearPendingReactionForThread(threadId).catch((error) => {
         console.error(`[codex-im] failed to clear pending reaction: ${error.message}`);
       });
       runtime.cleanupThreadRuntimeState(threadId);
     });
+}
+
+function rememberTerminalError(runtime, message) {
+  if (message?.method !== "error" || message?.params?.willRetry) {
+    return;
+  }
+  const params = message?.params || {};
+  if (isRecoverableStreamDisconnect(params)) {
+    return;
+  }
+  const errorText = codexMessageUtils.extractCodexErrorText(params)
+    || "本轮任务发生异常，未返回详细原因。";
+  const runKey = resolveTerminalErrorRunKey(runtime, message);
+  if (!runKey || !(runtime.turnFailureTextByRunKey instanceof Map)) {
+    return;
+  }
+  if (runtime.turnFailureTextByRunKey.has(runKey)) {
+    runtime.turnFailureTextByRunKey.delete(runKey);
+  }
+  runtime.turnFailureTextByRunKey.set(runKey, `执行失败：${errorText}`);
+  while (runtime.turnFailureTextByRunKey.size > MAX_TURN_FAILURE_CACHE_ENTRIES) {
+    const oldestRunKey = runtime.turnFailureTextByRunKey.keys().next().value;
+    if (!oldestRunKey) {
+      break;
+    }
+    runtime.turnFailureTextByRunKey.delete(oldestRunKey);
+  }
+}
+
+function getRememberedTerminalError(runtime, message) {
+  const runKey = resolveTerminalErrorRunKey(runtime, message);
+  if (!runKey || !(runtime.turnFailureTextByRunKey instanceof Map)) {
+    return "";
+  }
+  return String(runtime.turnFailureTextByRunKey.get(runKey) || "");
+}
+
+function forgetTerminalError(runtime, message) {
+  const runKey = resolveTerminalErrorRunKey(runtime, message);
+  if (runKey && runtime.turnFailureTextByRunKey instanceof Map) {
+    runtime.turnFailureTextByRunKey.delete(runKey);
+  }
+}
+
+function resolveTerminalErrorRunKey(runtime, message) {
+  const params = message?.params || {};
+  const threadId = String(params?.threadId || params?.thread?.id || "").trim();
+  if (!threadId) {
+    return "";
+  }
+  const turnId = String(
+    params?.turnId
+      || params?.turn?.id
+      || runtime.activeTurnIdByThreadId.get(threadId)
+      || ""
+  ).trim();
+  return turnId ? codexMessageUtils.buildRunKey(threadId, turnId) : "";
 }
 
 function trackLatestTokenUsage(runtime, message) {
@@ -133,16 +211,15 @@ function trackLatestToolUsage(runtime, message) {
     const turnId = String(params?.turnId || "");
     const itemId = String(item?.id || "");
     if (!threadId || !turnId || !itemId) {
-      return;
+      return false;
     }
     const prefix = method === "item/started" ? "开始" : "完成";
-    recordToolTrace(runtime, {
+    return recordToolTrace(runtime, {
       threadId,
       turnId,
       itemId,
       summary: summarizeToolItem(itemType, item, prefix),
     });
-    return;
   }
 
   if (isApprovalRequestEventMethod(method)) {
@@ -150,15 +227,53 @@ function trackLatestToolUsage(runtime, message) {
     const turnId = String(params?.turnId || "");
     const itemId = String(params?.itemId || message?.id || "");
     if (!threadId || !turnId || !itemId) {
-      return;
+      return false;
     }
-    recordToolTrace(runtime, {
+    return recordToolTrace(runtime, {
       threadId,
       turnId,
       itemId,
       summary: summarizeApprovalRequest(params),
     });
   }
+  return false;
+}
+
+function trackLatestReasoningSummary(runtime, message) {
+  const method = String(message?.method || "");
+  const params = message?.params || {};
+  const item = params?.item || {};
+  const itemType = String(item?.type || "").trim().toLowerCase();
+  const isReasoningDelta = method === "item/reasoning/delta"
+    || method === "item/reasoningSummary/delta"
+    || method === "item/reasoning/summaryPartAdded"
+    || method === "item/reasoningSummary/summaryPartAdded";
+
+  if (!isReasoningDelta && itemType !== "reasoning") {
+    return false;
+  }
+
+  const threadId = String(params?.threadId || "").trim();
+  const turnId = String(
+    params?.turnId
+      || params?.turn?.id
+      || runtime.activeTurnIdByThreadId.get(threadId)
+      || ""
+  ).trim();
+  const itemId = String(item?.id || params?.itemId || "reasoning").trim();
+  const summary = normalizeReasoningSummaryText(
+    params?.delta || params?.summary || item?.summary || item?.text
+  );
+  if (!threadId || !turnId || !itemId || !summary) {
+    return false;
+  }
+
+  return recordReasoningTrace(runtime, {
+    threadId,
+    turnId,
+    itemId,
+    summary,
+  });
 }
 
 function recordToolTrace(runtime, { threadId, turnId, itemId, summary }) {
@@ -166,18 +281,108 @@ function recordToolTrace(runtime, { threadId, turnId, itemId, summary }) {
   const normalizedTurnId = String(turnId || "");
   const normalizedItemId = String(itemId || "");
   if (!normalizedThreadId || !normalizedTurnId || !normalizedItemId) {
-    return;
+    return false;
   }
   const runKey = `${normalizedThreadId}:${normalizedTurnId}`;
   const current = runtime.toolItemIdsByRunKey.get(runKey) || new Set();
+  const isNewTool = !current.has(normalizedItemId);
   current.add(normalizedItemId);
   runtime.toolItemIdsByRunKey.set(runKey, current);
 
   const toolTrace = runtime.toolTraceByRunKey.get(runKey) || [];
+  let traceChanged = false;
   if (summary && !toolTrace.includes(summary)) {
     toolTrace.push(summary);
     runtime.toolTraceByRunKey.set(runKey, toolTrace.slice(-8));
+    traceChanged = true;
   }
+  return isNewTool || traceChanged;
+}
+
+function recordReasoningTrace(runtime, { threadId, turnId, itemId, summary }) {
+  if (!(runtime.reasoningTraceByRunKey instanceof Map)) {
+    runtime.reasoningTraceByRunKey = new Map();
+  }
+  const runKey = `${String(threadId || "")}:${String(turnId || "")}`;
+  const normalizedItemId = String(itemId || "").trim();
+  const normalizedSummary = normalizeReasoningSummaryText(summary);
+  if (!runKey || !normalizedItemId || !normalizedSummary) {
+    return false;
+  }
+
+  const trace = runtime.reasoningTraceByRunKey.get(runKey) || [];
+  const index = trace.findIndex((entry) => entry?.itemId === normalizedItemId);
+  const previous = index >= 0 ? String(trace[index]?.summary || "") : "";
+  const merged = mergeReasoningSummary(previous, normalizedSummary);
+  if (merged === previous) {
+    return false;
+  }
+
+  const next = index >= 0
+    ? trace.map((entry, entryIndex) => (entryIndex === index
+      ? { itemId: normalizedItemId, summary: merged }
+      : entry))
+    : [...trace, { itemId: normalizedItemId, summary: merged }];
+  runtime.reasoningTraceByRunKey.set(runKey, next.slice(-4));
+  return true;
+}
+
+function mergeReasoningSummary(current, incoming) {
+  const existing = String(current || "").trim();
+  const next = String(incoming || "").trim();
+  if (!existing) {
+    return next;
+  }
+  if (!next || existing === next || existing.includes(next)) {
+    return existing;
+  }
+  if (next.includes(existing)) {
+    return next;
+  }
+  return normalizeReasoningSummaryText(`${existing}\n${next}`);
+}
+
+function normalizeReasoningSummaryText(value) {
+  const clean = String(value || "")
+    .replace(/\u0000/g, "")
+    .replace(/\r\n/g, "\n")
+    .trim();
+  if (!clean) {
+    return "";
+  }
+  const maxLength = 2400;
+  if (clean.length <= maxLength) {
+    return clean;
+  }
+  return `${clean.slice(0, maxLength - 1).trimEnd()}…`;
+}
+
+function refreshStreamingReplyCardForProgress(runtime, message) {
+  const params = message?.params || {};
+  const threadId = String(params?.threadId || "").trim();
+  const turnId = String(
+    params?.turnId
+      || params?.turn?.id
+      || runtime.activeTurnIdByThreadId.get(threadId)
+      || ""
+  ).trim();
+  const chatId = String(runtime.pendingChatContextByThreadId.get(threadId)?.chatId || "").trim();
+  if (!threadId || !turnId || !chatId) {
+    return;
+  }
+  const runKey = codexMessageUtils.buildRunKey(threadId, turnId);
+  const currentRunKey = runtime.currentRunKeyByThreadId.get(threadId) || "";
+  if (!runtime.replyCardByRunKey.has(runKey) && !runtime.replyCardByRunKey.has(currentRunKey)) {
+    return;
+  }
+  runtime.upsertAssistantReplyCard({
+    threadId,
+    turnId,
+    chatId,
+    state: "streaming",
+  }).catch((error) => {
+    console.error(`[codex-im] failed to refresh streaming progress card: ${error.message}`);
+  });
 }
 
 function isToolLikeItemType(itemType) {
@@ -289,9 +494,6 @@ async function deliverToFeishu(runtime, event) {
       if (!runtime.config.feishuStreamingOutput) {
         return;
       }
-      if (runtime.config.feishuCardKitStreaming !== false) {
-        return;
-      }
       await runtime.upsertAssistantReplyCard({
         threadId: event.payload.threadId,
         turnId: event.payload.turnId,
@@ -299,13 +501,49 @@ async function deliverToFeishu(runtime, event) {
         state: "streaming",
       });
     } else if (event.payload.state === "completed") {
-      await runtime.upsertAssistantReplyCard({
-        threadId: event.payload.threadId,
-        turnId: event.payload.turnId,
-        chatId: event.payload.chatId,
-        state: "completed",
-      });
+      const inboundMessageId = runtime.pendingChatContextByThreadId
+        .get(event.payload.threadId)?.messageId || "";
+      try {
+        let delivery = await runtime.upsertAssistantReplyCard({
+          threadId: event.payload.threadId,
+          turnId: event.payload.turnId,
+          chatId: event.payload.chatId,
+          state: "completed",
+        });
+        let providerReceipt = String(delivery?.providerReceipt || "").trim();
+        if (!providerReceipt) {
+          // A missing provider receipt is an ambiguous outcome: Feishu can have
+          // accepted the first card while the client lost the response. Retrying
+          // the terminal flush here can therefore create a second reply card.
+          // Do not blindly resend; record the uncertain delivery for observability
+          // and leave the existing streaming card untouched.
+          console.warn(
+            "[codex-im] final reply had no provider receipt; suppressing blind final card retry to avoid duplicate delivery"
+          );
+          await runtime.deliveryReceipts.recordOutboundFailure({
+            inboundMessageId,
+            failureClass: "receipt-unknown",
+          });
+          return;
+        }
+        await runtime.deliveryReceipts.recordOutboundCompletion({
+          inboundMessageId,
+          providerReceipt,
+        });
+      } catch (error) {
+        await runtime.deliveryReceipts.recordOutboundFailure({
+          inboundMessageId,
+          failureClass: error?.code || error?.name || "send",
+        });
+        throw error;
+      }
     } else if (event.payload.state === "failed") {
+      const inboundMessageId = runtime.pendingChatContextByThreadId
+        .get(event.payload.threadId)?.messageId || "";
+      await runtime.deliveryReceipts.recordGenerationFailure({
+        inboundMessageId,
+        failureClass: "codex-turn",
+      });
       await runtime.upsertAssistantReplyCard({
         threadId: event.payload.threadId,
         turnId: event.payload.turnId,
@@ -313,6 +551,10 @@ async function deliverToFeishu(runtime, event) {
         text: event.payload.text || "执行失败",
         state: "failed",
       });
+    } else if (event.payload.state === "cancelled") {
+      const inboundMessageId = runtime.pendingChatContextByThreadId
+        .get(event.payload.threadId)?.messageId || "";
+      await runtime.deliveryReceipts.recordCancelled({ inboundMessageId });
     }
     return;
   }
@@ -351,6 +593,13 @@ function isTerminalTurnMessage(message) {
   if (params?.willRetry) {
     return false;
   }
+  const errorMessage = String(params?.error?.message || "");
+  const errorDetails = String(params?.error?.additionalDetails || "");
+  return /stream disconnected|Reconnecting/i.test(errorMessage)
+    || /stream disconnected/i.test(errorDetails);
+}
+
+function isRecoverableStreamDisconnect(params) {
   const errorMessage = String(params?.error?.message || "");
   const errorDetails = String(params?.error?.additionalDetails || "");
   return /stream disconnected|Reconnecting/i.test(errorMessage)

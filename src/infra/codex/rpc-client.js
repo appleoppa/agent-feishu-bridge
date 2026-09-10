@@ -1,13 +1,14 @@
 const { spawn } = require("child_process");
 const os = require("os");
 const WebSocket = require("ws");
+const { normalizeLogLevel, shouldLogCodexTraffic } = require("../../shared/log-level");
 
 const IS_WINDOWS = os.platform() === "win32";
 const DEFAULT_CODEX_COMMAND = "codex";
 const WINDOWS_EXECUTABLE_SUFFIX_RE = /\.(cmd|exe|bat)$/i;
 const CODEX_CLIENT_INFO = {
   name: "codex_im_agent",
-  title: "Codex IM Agent",
+  title: "Agent Bridge",
   version: "0.2.0",
 };
 
@@ -17,6 +18,7 @@ class CodexRpcClient {
     env = process.env,
     codexCommand = "",
     appServerProfile = "",
+    logLevel = "normal",
     requestTimeoutMs = 45000,
     turnStartTimeoutMs = 60000,
   }) {
@@ -24,6 +26,7 @@ class CodexRpcClient {
     this.env = env;
     this.codexCommand = codexCommand || resolveDefaultCodexCommand(env);
     this.appServerProfile = normalizeNonEmptyString(appServerProfile);
+    this.logLevel = normalizeLogLevel(logLevel);
     this.requestTimeoutMs = requestTimeoutMs;
     this.turnStartTimeoutMs = turnStartTimeoutMs;
     this.mode = endpoint ? "websocket" : "spawn";
@@ -74,7 +77,7 @@ class CodexRpcClient {
     if (!child) {
       const attempted = commandCandidates.join(", ");
       const detail = lastError?.message ? `: ${lastError.message}` : "";
-      throw new Error(`Unable to spawn Codex app-server. Tried ${attempted}${detail}. You can override with CODEX_IM_CODEX_COMMAND.`);
+      throw new Error(`Unable to spawn Codex app-server. Tried ${attempted}${detail}. You can override with AGENT_BRIDGE_CODEX_COMMAND.`);
     }
 
     this.child = child;
@@ -227,6 +230,38 @@ class CodexRpcClient {
       : this.sendRequest("thread/start", { input });
   }
 
+  async steerTurn({
+    threadId,
+    expectedTurnId,
+    text,
+    attachments = [],
+    clientUserMessageId = "",
+  }) {
+    const normalizedThreadId = normalizeNonEmptyString(threadId);
+    const normalizedExpectedTurnId = normalizeNonEmptyString(expectedTurnId);
+    const input = buildTurnInputPayload(text, attachments);
+    if (!normalizedThreadId) {
+      throw new Error("turn/steer requires a non-empty threadId");
+    }
+    if (!normalizedExpectedTurnId) {
+      throw new Error("turn/steer requires a non-empty expectedTurnId");
+    }
+    if (!input.length) {
+      throw new Error("turn/steer requires non-empty input");
+    }
+
+    const params = {
+      threadId: normalizedThreadId,
+      expectedTurnId: normalizedExpectedTurnId,
+      input,
+    };
+    const normalizedClientUserMessageId = normalizeNonEmptyString(clientUserMessageId);
+    if (normalizedClientUserMessageId) {
+      params.clientUserMessageId = normalizedClientUserMessageId;
+    }
+    return this.sendRequest("turn/steer", params);
+  }
+
   async startThread({ cwd }) {
     return this.sendRequest("thread/start", buildStartThreadParams(cwd));
   }
@@ -273,7 +308,7 @@ class CodexRpcClient {
       });
     });
 
-    logCodexOutboundMessage(`request:${method}`, payload);
+    logCodexOutboundMessage(`request:${method}`, payload, this.logLevel);
     try {
       this.sendRaw(payload);
     } catch (error) {
@@ -288,13 +323,13 @@ class CodexRpcClient {
 
   async sendNotification(method, params) {
     const payload = JSON.stringify({ method, params });
-    logCodexOutboundMessage(`notification:${method}`, payload);
+    logCodexOutboundMessage(`notification:${method}`, payload, this.logLevel);
     this.sendRaw(payload);
   }
 
   async sendResponse(id, result) {
     const payload = JSON.stringify({ id, result });
-    logCodexOutboundMessage("response", payload);
+    logCodexOutboundMessage("response", payload, this.logLevel);
     this.sendRaw(payload);
   }
 
@@ -319,7 +354,7 @@ class CodexRpcClient {
       logCodexParseFailure(rawMessage);
       return;
     }
-    logCodexInboundMessage(parsed);
+    logCodexInboundMessage(parsed, this.logLevel);
 
     if (parsed && parsed.method) {
       for (const listener of this.messageListeners) {
@@ -349,7 +384,7 @@ class CodexRpcClient {
   }
 
   getRequestTimeoutMs(method) {
-    if (method === "turn/start") {
+    if (method === "turn/start" || method === "turn/steer") {
       return this.turnStartTimeoutMs;
     }
     return this.requestTimeoutMs;
@@ -379,7 +414,11 @@ function tryParseJson(rawMessage) {
   }
 }
 
-function logCodexOutboundMessage(operation, payload) {
+function logCodexOutboundMessage(operation, payload, logLevel = "normal") {
+  const parsed = tryParseJson(payload);
+  if (!shouldLogCodexTraffic(parsed, logLevel)) {
+    return;
+  }
   try {
     const summary = summarizeRawCodexPayload(payload);
     console.log(`[codex-im] codex=> op=${operation} ${summary}`);
@@ -388,7 +427,10 @@ function logCodexOutboundMessage(operation, payload) {
   }
 }
 
-function logCodexInboundMessage(message) {
+function logCodexInboundMessage(message, logLevel = "normal") {
+  if (!shouldLogCodexTraffic(message, logLevel)) {
+    return;
+  }
   try {
     console.log(`[codex-im] codex<= ${summarizeCodexMessage(message)}`);
   } catch {
@@ -430,6 +472,12 @@ function summarizeCodexMessage(message) {
   if (message?.error?.message) {
     parts.push(`error=${JSON.stringify(message.error.message)}`);
   }
+  if (params?.error?.message) {
+    parts.push(`paramsError=${JSON.stringify(String(params.error.message).slice(0, 300))}`);
+  }
+  if (params?.error?.additionalDetails) {
+    parts.push(`paramsErrorDetails=${JSON.stringify(String(params.error.additionalDetails).slice(0, 300))}`);
+  }
   if (result?.data && Array.isArray(result.data)) {
     parts.push(`resultItems=${result.data.length}`);
   }
@@ -447,7 +495,9 @@ function logCodexParseFailure(rawMessage) {
 }
 
 function resolveDefaultCodexCommand(env = process.env) {
-  return normalizeNonEmptyString(env.CODEX_IM_CODEX_COMMAND) || DEFAULT_CODEX_COMMAND;
+  return normalizeNonEmptyString(env.AGENT_BRIDGE_CODEX_COMMAND)
+    || normalizeNonEmptyString(env.CODEX_IM_CODEX_COMMAND)
+    || DEFAULT_CODEX_COMMAND;
 }
 
 function buildCodexCommandCandidates(configuredCommand) {
@@ -511,8 +561,6 @@ function buildListThreadsParams({ cursor, limit, sortKey }) {
 
   if (normalizedCursor) {
     params.cursor = normalizedCursor;
-  } else if (cursor != null) {
-    params.cursor = cursor;
   }
 
   return params;
@@ -544,7 +592,9 @@ function normalizeImageAttachments(attachments) {
     return [];
   }
   return attachments
-    .filter((attachment) => attachment?.kind === "image" && normalizeNonEmptyString(attachment.filePath))
+    .filter((attachment) => attachment?.kind === "image"
+      && attachment?.imageMode !== "path"
+      && normalizeNonEmptyString(attachment.filePath))
     .map((attachment) => ({
       ...attachment,
       filePath: normalizeNonEmptyString(attachment.filePath),
@@ -576,10 +626,18 @@ function normalizeAccessMode(value) {
   if (normalized === "default") {
     return "current";
   }
-  return normalized === "full-access" ? normalized : "";
+  return (normalized === "full-access" || normalized === "group-readonly") ? normalized : "";
 }
 
 function buildExecutionPolicies(accessMode, workspaceRoot) {
+  // 群聊强制只读沙箱：物理上禁止任何写/删/清空操作（read-only sandbox 直接拒绝写入）。
+  // 这是对抗 prompt injection 的最硬防线，不依赖模型自觉。
+  if (accessMode === "group-readonly") {
+    return {
+      approvalPolicy: "on-request",
+      sandboxPolicy: { type: "readOnly", networkAccess: true },
+    };
+  }
   if (accessMode === "full-access") {
     return {
       approvalPolicy: "never",
@@ -603,4 +661,9 @@ function buildExecutionPolicies(accessMode, workspaceRoot) {
   };
 }
 
-module.exports = { CodexRpcClient };
+module.exports = {
+  CodexRpcClient,
+  logCodexInboundMessage,
+  logCodexOutboundMessage,
+  shouldLogCodexTraffic,
+};

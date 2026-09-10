@@ -1,20 +1,23 @@
 {
-  "name": "codex-feishu-bridge",
-  "version": "0.2.4",
-  "description": "A focused Feishu/Lark bridge for local Codex.",
-  "license": "MIT",
+  "name": "agent-feishu-bridge",
+  "version": "1.0.0",
+  "description": "自家二开的飞书桥：把本机 Agent（Codex / Claude / Opencode）接入飞书/Lark，流式卡片、推理展示、审批流、多后端可切换。",
+  "license": "SEE LICENSE IN LICENSE",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Jiao-Joe/codex-feishu-bridge.git"
+    "url": "git+https://github.com/Jokerautowrite/agent-feishu-bridge.git"
   },
-  "homepage": "https://github.com/Jiao-Joe/codex-feishu-bridge#readme",
+  "homepage": "https://github.com/Jokerautowrite/agent-feishu-bridge#readme",
   "bugs": {
-    "url": "https://github.com/Jiao-Joe/codex-feishu-bridge/issues"
+    "url": "https://github.com/Jokerautowrite/agent-feishu-bridge/issues"
   },
   "type": "commonjs",
   "main": "src/index.js",
   "keywords": [
     "codex",
+    "claude",
+    "opencode",
+    "agent",
     "feishu",
     "lark",
     "bot",
@@ -44,14 +47,23 @@
     "check": "find src bin scripts -name '*.js' -print0 | xargs -0 -n1 node --check",
     "test:markdown": "node ./scripts/test-assistant-markdown.js",
     "test:card-content": "node ./scripts/test-card-reply-content.js",
+    "test:log-level": "node ./scripts/test-log-level.js",
+    "test:delivery-receipts": "node ./scripts/test-delivery-receipt-hook.js",
+    "test:stale-turn-watchdog": "node ./scripts/test-stale-turn-watchdog.js",
+    "test:active-turn-steer": "node ./scripts/test-active-turn-steer.js",
     "test:media": "node ./scripts/test-media-fixtures.js",
     "test:directives": "node ./scripts/test-outbound-directives.js",
+    "test:group-service": "node ./scripts/test-group-service.js",
+    "test:group-identity": "node ./scripts/test-group-identity.js",
+    "test:group-admin": "node ./scripts/test-group-admin.js",
+    "test:group-authz": "node ./scripts/test-group-authz.js",
     "privacy:scan": "node ./scripts/privacy-scan.js",
     "pack:dry-run": "npm pack --dry-run",
-    "check:release": "npm run check && npm run test:markdown && npm run test:card-content && npm run test:media && npm run test:directives && npm run privacy:scan && npm audit --omit=dev && npm run pack:dry-run"
+    "check:release": "npm run check && npm run test:markdown && npm run test:card-content && npm run test:log-level && npm run test:delivery-receipts && npm run test:stale-turn-watchdog && npm run test:active-turn-steer && npm run test:media && npm run test:directives && npm run privacy:scan && npm audit --omit=dev && npm run pack:dry-run"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.62.0",
+    "@opencode-ai/sdk": "^1.15.10",
     "axios": "^1.15.2",
     "dotenv": "^16.4.7",
     "ws": "^8.19.0"

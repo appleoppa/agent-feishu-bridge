@@ -7,6 +7,7 @@ const {
   splitAssistantReplyForDisplay,
 } = require("../../shared/assistant-markdown");
 const { formatFailureText } = require("../../shared/error-text");
+const { splitOutputForCollapsedDisplay } = require("../../shared/output-collapse");
 const {
   buildApprovalCard,
   buildApprovalResolvedCard,
@@ -17,6 +18,169 @@ const {
 } = require("./builders");
 
 const CARDKIT_STREAMING_ELEMENT_ID = "streaming_content";
+const CARDKIT_BODY_MAX_BYTES = 16 * 1024;
+const CARD_ACTION_DEDUPE_WINDOW_MS = 2000;
+const cardActionLastSeen = new Map();
+
+function isDuplicateCardAction(action, normalized) {
+  const key = [
+    normalized?.chatId || "",
+    action?.kind || "",
+    action?.action || "",
+    action?.selectedValue
+      || action?.threadId
+      || action?.workspaceRoot
+      || action?.formValue?.project_name
+      || action?.requestId
+      || "",
+  ].join("|");
+  if (!key || key === "|||" || key === "||||") {
+    return false;
+  }
+  const now = Date.now();
+  const last = cardActionLastSeen.get(key) || 0;
+  if (now - last < CARD_ACTION_DEDUPE_WINDOW_MS) {
+    return true;
+  }
+  cardActionLastSeen.set(key, now);
+  if (cardActionLastSeen.size > 500) {
+    for (const [seenKey, seenAt] of cardActionLastSeen) {
+      if (now - seenAt > 10 * 1000) {
+        cardActionLastSeen.delete(seenKey);
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * 长消息分片：把超长正文按段落切成多块（每块 <= maxBytes），
+ * 尽量在段落边界切分，避免拆散代码块。
+ */
+function splitLongText(text, maxBytes) {
+  const normalized = String(text || "").trim();
+  if (!normalized) {
+    return [];
+  }
+  if (Buffer.byteLength(normalized, "utf8") <= maxBytes) {
+    return [normalized];
+  }
+
+  // 优先按段落（\n\n）切；段落过长时再按行兜底
+  const paragraphs = normalized.split(/\n{2,}/);
+  const chunks = [];
+  let current = "";
+
+  const flush = () => {
+    if (!current.trim()) return;
+    chunks.push(current.trim());
+    current = "";
+  };
+
+  for (const paragraph of paragraphs) {
+    if (!paragraph.trim()) continue;
+    const candidate = current ? `${current}\n\n${paragraph}` : paragraph;
+    if (Buffer.byteLength(candidate, "utf8") <= maxBytes) {
+      current = candidate;
+      continue;
+    }
+    flush();
+    if (Buffer.byteLength(paragraph, "utf8") <= maxBytes) {
+      current = paragraph;
+      continue;
+    }
+    // 单个段落超长：按行拆
+    const lines = paragraph.split("\n");
+    let lineChunk = "";
+    for (const line of lines) {
+      const next = lineChunk ? `${lineChunk}\n${line}` : line;
+      if (Buffer.byteLength(next, "utf8") <= maxBytes) {
+        lineChunk = next;
+      } else {
+        if (lineChunk) chunks.push(lineChunk.trim());
+        lineChunk = line;
+      }
+    }
+    if (lineChunk) chunks.push(lineChunk.trim());
+    lineChunk = "";
+  }
+  flush();
+  return chunks.length ? chunks : [normalized];
+}
+
+/**
+ * 飞书回复卡片外观参数（改这里即可换肤，无需动其他代码）
+ *
+ * 所有颜色均支持 light_mode（浅色主题）与 dark_mode（深色主题）两套值，
+ * 格式为 rgba(r,g,b,a)，a 为透明度（0~1）。
+ *
+ * | 参数名 | 作用 | 阈值逻辑 |
+ * | --- | --- | --- |
+ * | cus-progress-green | 进度条实心格颜色（低占用） | 上下文 <70% |
+ * | cus-progress-yellow | 进度条实心格颜色（中占用） | 上下文 70%~89% |
+ * | cus-progress-red | 进度条实心格颜色（高占用） | 上下文 >=90% |
+ * | cus-line-green | 底部分割线颜色（低占用） | 上下文 <70%，与进度条同逻辑 |
+ * | cus-line-yellow | 底部分割线颜色（中占用） | 上下文 70%~89% |
+ * | cus-line-red | 底部分割线颜色（高占用） | 上下文 >=90% |
+ * | cus-panel-green | 🛠️ 执行耗时面板 描边+标题色 | 固定 |
+ * | cus-panel-blue | 💭 推理过程面板 描边+标题色 | 固定 |
+ * | cus-panel-purple | 📄 输出结果面板 描边+标题色 | 固定 |
+ * | cus-body-bg | 正文区淡底色（column_set background_style） | 固定 |
+ * | cus-foot-grey | footer 模型/强度/耗时 灰字 | 固定 |
+ *
+ * 其他可调参数：
+ * - 进度条格数：buildNativeProgressBarText(pct, cells=7) 的 cells
+ * - 上下文阈值：buildNativeProgressBarText 内 safePct >= 90 / >= 70
+ * - header 状态色：buildCardKitHeaderTemplate（streaming=indigo / completed=green / failed=red）
+ * - 工具面板行数上限：formatToolTraceText 内 clipLines(..., 2)
+ * - 正文段落间距：src/shared/assistant-markdown.js 内 \n{4,} 归并规则
+ */
+const CARDKIT_CUSTOM_COLORS = {
+  "cus-body-bg": {
+    light_mode: "rgba(64,120,255,0.10)",
+    dark_mode: "rgba(64,120,255,0.12)",
+  },
+  "cus-line-green": {
+    light_mode: "rgba(52,199,89,1)",
+    dark_mode: "rgba(52,199,89,1)",
+  },
+  "cus-line-yellow": {
+    light_mode: "rgba(245,217,10,1)",
+    dark_mode: "rgba(245,217,10,1)",
+  },
+  "cus-line-red": {
+    light_mode: "rgba(255,69,58,1)",
+    dark_mode: "rgba(255,69,58,1)",
+  },
+  "cus-panel-green": {
+    light_mode: "rgba(52,199,89,1)",
+    dark_mode: "rgba(52,199,89,1)",
+  },
+  "cus-panel-blue": {
+    light_mode: "rgba(84,140,255,1)",
+    dark_mode: "rgba(84,140,255,1)",
+  },
+  "cus-panel-purple": {
+    light_mode: "rgba(123,97,255,1)",
+    dark_mode: "rgba(164,143,255,1)",
+  },
+  "cus-foot-grey": {
+    light_mode: "rgba(31,35,41,0.85)",
+    dark_mode: "rgba(255,255,255,0.85)",
+  },
+  "cus-progress-green": {
+    light_mode: "rgba(52,199,89,1)",
+    dark_mode: "rgba(52,199,89,1)",
+  },
+  "cus-progress-yellow": {
+    light_mode: "rgba(245,217,10,1)",
+    dark_mode: "rgba(245,217,10,1)",
+  },
+  "cus-progress-red": {
+    light_mode: "rgba(255,69,58,1)",
+    dark_mode: "rgba(255,69,58,1)",
+  },
+};
 
 async function sendInfoCardMessage(runtime, { chatId, text, replyToMessageId = "", replyInThread = false, kind = "info" }) {
   if (!chatId || !text) {
@@ -87,6 +251,20 @@ async function patchInteractiveCard(runtime, { messageId, card }) {
 
 async function handleCardAction(runtime, data) {
   const action = messageNormalizers.extractCardAction(data);
+  const senderAllowlist = Array.isArray(runtime.config?.cardActionSenderAllowlist)
+    ? runtime.config.cardActionSenderAllowlist
+    : [];
+  const operatorSenderIds = messageNormalizers.extractCardOperatorSenderIds
+    ? messageNormalizers.extractCardOperatorSenderIds(data)
+    : [];
+  const chatId = messageNormalizers.extractCardChatId
+    ? messageNormalizers.extractCardChatId(data)
+    : "";
+  const chatType = typeof runtime.resolveChatType === "function"
+    ? runtime.resolveChatType(chatId)
+    : "";
+  const isAllowedOperator = !senderAllowlist.length
+    || isAllowedCardOperator(operatorSenderIds, senderAllowlist, chatType);
   console.log(
     `[codex-im] card callback kind=${action?.kind || "-"} action=${action?.action || "-"} `
     + `thread=${action?.threadId || "-"} request=${action?.requestId || "-"} selected=${action?.selectedValue || "-"}`
@@ -97,6 +275,18 @@ async function handleCardAction(runtime, data) {
   }
 
   if (action.kind === "approval") {
+    if (!isAllowedOperator) {
+      console.warn("[codex-im] card approval rejected by sender allowlist", {
+        operatorIds: operatorSenderIds,
+      });
+      // 群聊里非管理员点审批按钮 → 静默忽略。
+      // chatType 未知（解析不出群聊上下文，如外部群）也保守静默，防止群里刷提示。
+      if (chatType === "group" || !chatType) {
+        return buildCardResponse({});
+      }
+      runCardActionTask(runtime, sendCardActionFeedback(runtime, data, "你没有审批该请求的权限。", "error"));
+      return buildCardResponse({});
+    }
     runCardActionTask(runtime, runtime.handleApprovalCardActionAsync(action, data));
     return buildCardResponse({});
   }
@@ -104,6 +294,36 @@ async function handleCardAction(runtime, data) {
   const normalized = messageNormalizers.normalizeCardActionContext(data, runtime.config);
   if (!normalized) {
     runCardActionTask(runtime, sendCardActionFeedback(runtime, data, "无法解析当前卡片上下文。", "error"));
+    return buildCardResponse({});
+  }
+
+  if (!isAllowedOperator) {
+    console.warn("[codex-im] card action rejected by sender allowlist", {
+      operatorIds: operatorSenderIds,
+      actionKind: action.kind,
+      actionName: action.action || "",
+    });
+    // 群聊里非管理员点卡片按钮 → 静默忽略（不回复任何提示，防止刷屏）。
+    // chatType 未知（解析不出群聊上下文，如外部群）也保守静默。
+    if (chatType === "group" || !chatType) {
+      return buildCardResponse({});
+    }
+    runCardActionTask(
+      runtime,
+      sendCardActionFeedbackByContext(runtime, normalized, "你没有操作该卡片的权限。", "error")
+    );
+    return buildCardResponse({});
+  }
+
+  if (isDuplicateCardAction(action, normalized)) {
+    // 群聊里重复点击 → 静默忽略
+    if (chatType === "group") {
+      return buildCardResponse({});
+    }
+    runCardActionTask(
+      runtime,
+      sendCardActionFeedbackByContext(runtime, normalized, "操作已处理，请勿重复点击。", "info")
+    );
     return buildCardResponse({});
   }
 
@@ -122,6 +342,20 @@ async function handleCardAction(runtime, data) {
 
   runCardActionTask(runtime, sendCardActionFeedbackByContext(runtime, normalized, "未支持的卡片操作。", "error"));
   return buildCardResponse({});
+}
+
+function isAllowedCardOperator(operatorSenderIds, senderAllowlist, chatType) {
+  const [openId = "", userId = ""] = operatorSenderIds;
+  // 私聊：open_id 随会话变化不可靠，只校验稳定的 user_id。
+  if (chatType === "p2p") {
+    return Boolean(userId && senderAllowlist.includes(userId));
+  }
+  // 群聊：user_id 或 open_id 任一命中即可。
+  if (chatType === "group") {
+    return operatorSenderIds.some((id) => id && senderAllowlist.includes(id));
+  }
+  // 未知会话类型：任一命中即可（宽松，避免误锁用户）。
+  return operatorSenderIds.some((id) => id && senderAllowlist.includes(id));
 }
 
 function queueCardActionWithFeedback(runtime, normalized, feedbackText, task) {
@@ -204,19 +438,30 @@ async function upsertAssistantReplyCard(
   const preferredRunKey = codexMessageUtils.buildRunKey(threadId, resolvedTurnId);
   let runKey = preferredRunKey;
   let existing = runtime.replyCardByRunKey.get(runKey) || null;
+  let reusedCurrentRunForTerminalState = false;
 
   if (!existing) {
     const currentRunKey = runtime.currentRunKeyByThreadId.get(threadId) || "";
     const currentEntry = runtime.replyCardByRunKey.get(currentRunKey) || null;
+    const hasTerminalState = state === "completed" || state === "failed";
     const shouldReuseCurrent = !!(
       currentEntry
       && currentEntry.state !== "completed"
       && currentEntry.state !== "failed"
-      && (!resolvedTurnId || !currentEntry.turnId || currentEntry.turnId === resolvedTurnId)
+      && (
+        !resolvedTurnId
+        || !currentEntry.turnId
+        || currentEntry.turnId === resolvedTurnId
+        || hasTerminalState
+      )
     );
     if (shouldReuseCurrent) {
       runKey = currentRunKey;
       existing = currentEntry;
+      reusedCurrentRunForTerminalState = hasTerminalState
+        && !!resolvedTurnId
+        && !!currentEntry.turnId
+        && currentEntry.turnId !== resolvedTurnId;
     }
   }
 
@@ -231,6 +476,8 @@ async function upsertAssistantReplyCard(
       state: "streaming",
       threadId,
       turnId: resolvedTurnId,
+      model: resolveConfiguredReplyModel(runtime, threadId),
+      effort: resolveConfiguredReplyEffort(runtime, threadId),
       startedAt: Date.now(),
       cardKitCardId: "",
       cardKitSequence: 0,
@@ -254,8 +501,14 @@ async function upsertAssistantReplyCard(
       existing.state = nextState;
     }
   }
-  if (resolvedTurnId) {
+  if (resolvedTurnId && !reusedCurrentRunForTerminalState) {
     existing.turnId = resolvedTurnId;
+  }
+  if (!existing.model) {
+    existing.model = resolveConfiguredReplyModel(runtime, threadId);
+  }
+  if (!existing.effort) {
+    existing.effort = resolveConfiguredReplyEffort(runtime, threadId);
   }
 
   runtime.setReplyCardEntry(runKey, existing);
@@ -268,7 +521,7 @@ async function upsertAssistantReplyCard(
   const shouldFlushImmediately = existing.state === "completed"
     || existing.state === "failed"
     || (!existing.messageId && typeof existing.text === "string" && existing.text.trim());
-  await scheduleReplyCardFlush(runtime, runKey, { immediate: shouldFlushImmediately });
+  return scheduleReplyCardFlush(runtime, runKey, { immediate: shouldFlushImmediately });
 }
 
 function applyAssistantReplyText(entry, text, mode = "delta") {
@@ -296,6 +549,10 @@ function applyCompletedAssistantSnapshot(entry, text) {
     entry.processText = mergeProcessText(entry.processText, processPrefix);
   }
 
+  // 定稿快照（message_end 完整文本）是权威最终正文，一律覆盖：
+  // Pi 一轮会流式输出多条中间汇报（工具间隙的“我先实查…”等），它们拼接进
+  // entry.text 会导致最终卡片正文粘连；快照是最新一条完整答复，覆盖后正文干净。
+  // 快照由 Pi 的 message_end 提供（每条都是完整消息，不是部分快照），覆盖安全。
   entry.answerText = completedText;
   entry.text = completedText;
 }
@@ -306,12 +563,21 @@ function extractProcessPrefixFromCompletedSnapshot(accumulated, completedText) {
   if (!normalizedAccumulated || !normalizedCompleted || normalizedAccumulated === normalizedCompleted) {
     return "";
   }
-  if (normalizedAccumulated.endsWith(normalizedCompleted)) {
-    return normalizedAccumulated.slice(0, normalizedAccumulated.length - normalizedCompleted.length).trim();
-  }
-  const markerIndex = normalizedAccumulated.lastIndexOf(normalizedCompleted);
-  if (markerIndex > 0) {
-    return normalizedAccumulated.slice(0, markerIndex).trim();
+
+  // Only treat a prefix as "process" text when the completed snapshot starts
+  // with an explicit conclusion marker. Reasoning models (deepseek) may emit
+  // partial snapshots that end at a mid-sentence boundary; blindly stripping
+  // "everything before the snapshot" used to swallow the real opening of the
+  // answer.
+  const conclusionMarker = /(?:^(?:已完成|结论是|先说结论|答案是|处理好了)[，,。；;：:\s])/;
+  if (conclusionMarker.test(normalizedCompleted)) {
+    const markerIndex = normalizedAccumulated.lastIndexOf(normalizedCompleted);
+    if (markerIndex > 0) {
+      return normalizedAccumulated.slice(0, markerIndex).trim();
+    }
+    if (normalizedAccumulated.endsWith(normalizedCompleted)) {
+      return normalizedAccumulated.slice(0, normalizedAccumulated.length - normalizedCompleted.length).trim();
+    }
   }
   return "";
 }
@@ -342,8 +608,7 @@ async function scheduleReplyCardFlush(runtime, runKey, { immediate = false } = {
 
   if (immediate) {
     clearReplyFlushTimer(runtime, runKey);
-    await enqueueReplyCardFlush(runtime, runKey);
-    return;
+    return enqueueReplyCardFlush(runtime, runKey);
   }
 
   if (runtime.replyFlushTimersByRunKey.has(runKey)) {
@@ -376,24 +641,41 @@ async function flushReplyCard(runtime, runKey) {
 
   if (shouldUseCardKitReply(runtime, entry)) {
     try {
-      await flushCardKitReplyCard(runtime, runKey, entry);
-      return;
+      return await flushCardKitReplyCard(runtime, runKey, entry);
     } catch (error) {
-      console.error(`[codex-im] CardKit reply failed, falling back to legacy card: ${error.message}`);
+      const openUntil = openCardKitCircuit(runtime, error);
+      const cooldownText = openUntil > Date.now()
+        ? `; CardKit paused for ${Math.ceil((openUntil - Date.now()) / 1000)}s`
+        : "";
+      console.error(
+        `[codex-im] CardKit reply failed, falling back to legacy card${cooldownText}: ${error.message}`
+      );
       entry.fallbackUsed = true;
+      entry.messageId = "";
+      entry.cardKitCardId = "";
       runtime.setReplyCardEntry(runKey, entry);
     }
   }
 
-  await flushLegacyReplyCard(runtime, runKey, entry);
+  return flushLegacyReplyCard(runtime, runKey, entry);
 }
 
-function shouldUseCardKitReply(runtime, entry) {
+function shouldUseCardKitReply(runtime, entry, now = Date.now()) {
   return Boolean(
     runtime.config.feishuCardKitStreaming !== false
     && entry
     && !entry.fallbackUsed
+    && Number(runtime.cardKitCircuitOpenUntil || 0) <= now
   );
+}
+
+function openCardKitCircuit(runtime, error, now = Date.now()) {
+  const cooldownMs = Number(runtime?.config?.cardKitFailureCooldownMs || 0);
+  runtime.cardKitCircuitLastReason = String(error?.message || "unknown CardKit error").slice(0, 240);
+  runtime.cardKitCircuitOpenUntil = Number.isFinite(cooldownMs) && cooldownMs > 0
+    ? now + cooldownMs
+    : 0;
+  return runtime.cardKitCircuitOpenUntil;
 }
 
 async function flushCardKitReplyCard(runtime, runKey, entry) {
@@ -427,7 +709,7 @@ async function flushCardKitReplyCard(runtime, runKey, entry) {
   if (entry.state === "completed" || entry.state === "failed") {
     await finalizeCardKitReply(runtime, entry);
     runtime.disposeReplyRunState(runKey, entry.threadId);
-    return;
+    return { providerReceipt: entry.messageId };
   }
 
   const content = buildCardKitStreamingContent(entry);
@@ -461,7 +743,23 @@ async function flushCardKitReplyCard(runtime, runKey, entry) {
 
 async function finalizeCardKitReply(runtime, entry) {
   const adapter = runtime.requireFeishuAdapter();
-  const card = buildCardKitFinalCard(runtime, entry);
+  const display = buildAssistantDisplayContent(entry);
+  const card = buildCardKitFinalCard(runtime, entry, display);
+
+  // [debug] 打印最终卡元素结构摘要，便于定位渲染异常
+  try {
+    const bodyElements = (card?.body?.elements || []).map((el) => {
+      if (el?.tag === "column_set" && Array.isArray(el?.column_list)) {
+        return el.column_list.map((col) => (col?.elements || []).map((c) => c?.tag)).join("|");
+      }
+      return String(el?.tag || "?");
+    });
+    const summary = (card?.body?.elements || []).map((el) => el?.tag).join(",");
+    const contentSnippet = String(display?.answer || "").slice(0, 120).replace(/\n/g, "\\n");
+    console.log(`[cardkit] FINAL card summary=${summary} bodyElements=${bodyElements.join(" ; ")} contentHead=${contentSnippet}`);
+  } catch (debugErr) {
+    console.warn(`[cardkit] debug log failed: ${debugErr.message}`);
+  }
 
   entry.cardKitSequence += 1;
   await adapter.setCardStreamingMode({
@@ -476,21 +774,28 @@ async function finalizeCardKitReply(runtime, entry) {
     card,
     sequence: entry.cardKitSequence,
   });
+
+  // 长回复分片：主卡只放第一片，剩余内容逐片作为独立消息发送
+  const chunks = Array.isArray(display.chunks) ? display.chunks : [];
+  const totalPieces = chunks.length + 1;
+  for (let i = 0; i < chunks.length; i++) {
+    await sendInfoCardMessage(runtime, {
+      chatId: entry.chatId,
+      text: `**📄 续篇 ${i + 2}/${totalPieces}**\n\n${chunks[i]}`,
+      kind: "info",
+    });
+  }
 }
 
 function buildCardKitStreamingCard(runtime, runKey, entry, options = {}) {
   const content = typeof options.content === "string" ? options.content : buildCardKitStreamingContent(entry);
   const elements = [
     ...buildCardKitStatusPanels(runtime, runKey, entry),
-    {
-      tag: "markdown",
-      content,
-      text_align: "left",
-      text_size: "normal_v2",
-      margin: "0px 0px 0px 0px",
-      element_id: CARDKIT_STREAMING_ELEMENT_ID,
-    },
+    buildCardKitBodyContainer(content, { elementId: CARDKIT_STREAMING_ELEMENT_ID }),
   ];
+  if (entry.state === "streaming") {
+    elements.push(buildCardKitStopButton(entry));
+  }
 
   return {
     schema: "2.0",
@@ -498,9 +803,19 @@ function buildCardKitStreamingCard(runtime, runKey, entry, options = {}) {
       streaming_mode: true,
       wide_screen_mode: true,
       update_multi: true,
+      style: {
+        color: CARDKIT_CUSTOM_COLORS,
+      },
       summary: {
         content: buildCardKitSummary(content, entry.state),
       },
+    },
+    header: {
+      title: {
+        tag: "plain_text",
+        content: buildCardKitHeaderTitle(entry),
+      },
+      template: buildCardKitHeaderTemplate(entry),
     },
     body: {
       elements,
@@ -508,29 +823,99 @@ function buildCardKitStreamingCard(runtime, runKey, entry, options = {}) {
   };
 }
 
-function buildCardKitFinalCard(runtime, entry) {
+function buildCardKitBodyContainer(content, options = {}) {
+  const markdownElement = {
+    tag: "markdown",
+    content,
+    text_align: "left",
+    text_size: options.textSize || "normal_v2",
+    margin: "0px 0px 0px 0px",
+  };
+  if (options.elementId) {
+    markdownElement.element_id = options.elementId;
+  }
+  return {
+    tag: "column_set",
+    flex_mode: "none",
+    background_style: "cus-body-bg",
+    horizontal_spacing: "12px",
+    columns: [
+      {
+        tag: "column",
+        width: "weighted",
+        weight: 1,
+        elements: [markdownElement],
+      },
+    ],
+  };
+}
+
+function buildCardKitFooterDivider(pct) {
+  const safePct = Math.max(0, Math.min(100, Number(pct) || 0));
+  const color = safePct >= 90
+    ? "cus-line-red"
+    : safePct >= 70
+      ? "cus-line-yellow"
+      : "cus-line-green";
+  return {
+    tag: "column_set",
+    flex_mode: "none",
+    background_style: color,
+    horizontal_spacing: "0px",
+    columns: [
+      {
+        tag: "column",
+        width: "weighted",
+        weight: 1,
+        padding: "0px 0px 0px 0px",
+        elements: [{ tag: "markdown", content: "", margin: "0px 0px 0px 0px" }],
+      },
+    ],
+  };
+}
+
+function buildCardKitStopButton(entry) {
+  return {
+    tag: "column_set",
+    flex_mode: "none",
+    columns: [
+      {
+        tag: "column",
+        width: "weighted",
+        weight: 1,
+        elements: [
+          {
+            tag: "button",
+            text: { tag: "plain_text", content: "🛑 停止" },
+            type: "danger",
+            value: {
+              kind: "panel",
+              action: "stop",
+              threadId: entry.threadId || "",
+              requestId: entry.turnId || "",
+            },
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function buildCardKitFinalCard(runtime, entry, displayOverride) {
   const runKey = codexMessageUtils.buildRunKey(entry.threadId, entry.turnId);
-  const display = buildAssistantDisplayContent(entry);
+  const display = displayOverride || buildAssistantDisplayContent(entry);
   const content = display.answer;
-  const footer = buildCardKitFooter(runtime, entry);
+  const footerElements = buildCardKitFooter(runtime, entry);
   const elements = [
     ...buildCardKitStatusPanels(runtime, runKey, entry),
-    {
-      tag: "markdown",
-      content,
-      text_align: "left",
-      text_size: "normal_v2",
-      margin: "0px 0px 0px 0px",
-      element_id: CARDKIT_STREAMING_ELEMENT_ID,
-    },
+    ...buildCardKitOutputElements(runtime, content),
   ];
 
-  if (footer) {
-    elements.push({
-      tag: "markdown",
-      content: footer,
-      text_size: "notation",
-    });
+  if (footerElements.length) {
+    const contextText = formatContextText(runtime.latestTokenUsageByThreadId.get(entry.threadId));
+    const ctx = contextText ? parseContextPercent(contextText) : null;
+    elements.push(buildCardKitFooterDivider(ctx?.pct));
+    elements.push(...footerElements);
   }
 
   return {
@@ -539,45 +924,145 @@ function buildCardKitFinalCard(runtime, entry) {
       streaming_mode: false,
       wide_screen_mode: true,
       update_multi: true,
+      style: {
+        color: CARDKIT_CUSTOM_COLORS,
+      },
       summary: {
         content: buildCardKitSummary(content, entry.state),
       },
+    },
+    header: {
+      title: {
+        tag: "plain_text",
+        content: buildCardKitHeaderTitle(entry),
+      },
+      template: buildCardKitHeaderTemplate(entry),
     },
     body: { elements },
   };
 }
 
+function buildCardKitOutputElements(runtime, content) {
+  const visibleTailPercent = Number(runtime?.config?.outputVisibleTailPercent || 10);
+  const split = splitOutputForCollapsedDisplay(content, {
+    visibleTailRatio: visibleTailPercent / 100,
+  });
+  if (!split.collapsedContent) {
+    return [buildCardKitBodyContainer(split.visibleContent)];
+  }
+  return [
+    buildCardKitCollapsiblePanel({
+      title: "📄 输出结果 · 展开全文",
+      content: buildCardKitBodyContainer(split.collapsedContent),
+      titleColor: "cus-panel-purple",
+      borderColor: "cus-panel-purple",
+      expanded: false,
+    }),
+    buildCardKitBodyContainer(split.visibleContent),
+  ];
+}
+
 function buildCardKitStatusPanels(runtime, runKey, entry) {
   const toolTrace = runtime.toolTraceByRunKey.get(runKey);
+  const reasoningTrace = runtime.reasoningTraceByRunKey?.get(runKey);
   const elapsed = formatReplyElapsed(entry.startedAt);
   const tokenUsage = runtime.latestTokenUsageByThreadId.get(entry.threadId);
   const display = buildAssistantDisplayContent(entry);
+  const chatType = typeof runtime.resolveChatType === "function"
+    ? runtime.resolveChatType(entry?.chatId)
+    : "";
+  const reasoningMode = chatType === "group"
+    ? resolveGroupCardReasoningMode(runtime?.config)
+    : "full";
   return [
     buildCardKitCollapsiblePanel({
       title: buildToolPanelTitle(runtime.toolItemIdsByRunKey.get(runKey), entry.state),
       content: formatToolTraceText(toolTrace, entry.state),
+      titleColor: "cus-panel-green",
+      borderColor: "cus-panel-green",
     }),
-    buildCardKitCollapsiblePanel({
-      title: entry.state === "streaming" ? "💭 正在想" : "💭 思考完成",
-      content: formatThinkingText({
-        state: entry.state,
-        elapsed,
-        toolTrace,
-        tokenUsage,
-        assistantNotes: display.notes,
-      }),
+    buildGroupReasoningPanel(runtime, entry, {
+      reasoningTrace,
+      elapsed,
+      tokenUsage,
+      assistantNotes: display.notes,
+      reasoningMode,
     }),
   ];
 }
 
-function buildCardKitCollapsiblePanel({ title, content }) {
+/**
+ * 推理面板：私聊显示完整推理（full）；群聊按配置收敛——
+ * none（默认，方案 B）：不显示推理内容，只显示“正在推理…/推理完成”状态，且不展开。
+ * brief（方案 A）：只显示推理摘要前 2 行，且不展开。
+ */
+function buildGroupReasoningPanel(runtime, entry, {
+  reasoningTrace,
+  elapsed,
+  tokenUsage,
+  assistantNotes,
+  reasoningMode,
+}) {
+  const isStreaming = entry.state === "streaming";
+  if (reasoningMode === "none") {
+    return buildCardKitCollapsiblePanel({
+      title: isStreaming ? "💭 正在推理…" : "💭 推理完成",
+      content: isStreaming
+        ? (elapsed ? `正在处理，已运行约 ${elapsed}。` : "正在处理。")
+        : (elapsed ? `已完成，耗时约 ${elapsed}；最终结论见下方正文。` : "已完成；最终结论见下方正文。"),
+      titleColor: "cus-panel-blue",
+      borderColor: "cus-panel-blue",
+      expanded: false,
+    });
+  }
+
+  const fullText = formatThinkingText({
+    state: entry.state,
+    elapsed,
+    reasoningTrace,
+    tokenUsage,
+    assistantNotes,
+  });
+  if (reasoningMode === "brief") {
+    const briefText = fullText.split("\n").slice(0, 2).join("\n");
+    return buildCardKitCollapsiblePanel({
+      title: isStreaming ? "💭 推理过程（实时）" : "💭 推理过程（完成）",
+      content: briefText,
+      titleColor: "cus-panel-blue",
+      borderColor: "cus-panel-blue",
+      expanded: false,
+    });
+  }
+
+  return buildCardKitCollapsiblePanel({
+    title: isStreaming ? "💭 推理过程（实时）" : "💭 推理过程（完成）",
+    content: fullText,
+    titleColor: "cus-panel-blue",
+    borderColor: "cus-panel-blue",
+    expanded: isStreaming,
+  });
+}
+
+function resolveGroupCardReasoningMode(config) {
+  const mode = String(config?.groupCardReasoningMode || "none").toLowerCase();
+  return ["none", "brief", "full"].includes(mode) ? mode : "none";
+}
+
+function buildCardKitCollapsiblePanel({
+  title,
+  content,
+  expanded = false,
+  titleColor,
+  borderColor,
+  textSize = "notation",
+}) {
   return {
     tag: "collapsible_panel",
-    expanded: false,
+    expanded: Boolean(expanded),
     header: {
       title: {
-        tag: "plain_text",
-        content: title,
+        tag: titleColor ? "markdown" : "plain_text",
+        content: titleColor ? `<font color='${titleColor}'>${title}</font>` : title,
       },
       icon: {
         tag: "standard_icon",
@@ -587,15 +1072,11 @@ function buildCardKitCollapsiblePanel({ title, content }) {
       icon_position: "follow_text",
       icon_expanded_angle: -180,
     },
-    border: { color: "grey", corner_radius: "5px" },
+    border: { color: borderColor || "grey", corner_radius: "5px" },
     padding: "8px 8px 8px 8px",
-    elements: [
-      {
-        tag: "markdown",
-        content,
-        text_size: "notation",
-      },
-    ],
+    elements: typeof content === "object" && content
+      ? [content]
+      : [{ tag: "markdown", content, text_size: textSize }],
   };
 }
 
@@ -611,21 +1092,87 @@ function buildToolPanelTitle(toolItems, state) {
 }
 
 function buildCardKitStreamingContent(entry) {
+  // 流式阶段只显示占位：飞书 streaming 状态渲染不认空行分段（实测：
+  // streaming_mode=true 时 markdown 空行被压平，多段正文在生成中显示为“一坨”）。
+  // 正文改为生成完成后由 buildCardKitFinalCard 一次性渲染，保证用户永远看到完整正常排版。
+  if (entry.state === "streaming") {
+    return "⏳ 正在生成回复…（内容生成完成后显示）";
+  }
   return buildAssistantDisplayContent(entry).answer;
 }
 
 function buildCardKitStatusSignature(runtime, runKey, entry) {
   const toolItems = runtime.toolItemIdsByRunKey.get(runKey);
   const toolTrace = runtime.toolTraceByRunKey.get(runKey);
+  const reasoningTrace = runtime.reasoningTraceByRunKey?.get(runKey);
   const tokenUsage = runtime.latestTokenUsageByThreadId.get(entry.threadId);
   const display = buildAssistantDisplayContent(entry);
   return JSON.stringify({
     state: entry.state,
     toolCount: toolItems instanceof Set ? toolItems.size : 0,
     toolTrace: Array.isArray(toolTrace) ? toolTrace.filter(Boolean) : [],
+    reasoningTrace: Array.isArray(reasoningTrace)
+      ? reasoningTrace.map((entry) => ({
+        itemId: String(entry?.itemId || ""),
+        summary: String(entry?.summary || ""),
+      }))
+      : [],
     reasoning: Number(tokenUsage?.last?.reasoningOutputTokens || 0),
     notes: display.notes,
   });
+}
+
+/**
+ * 正文完成态行去重：Pi 最终答复有时包含多行完成态（旧格式“（完成） · 完成时间 …”
+ * 与 SOUL 2026-08-09 新增的“（完成态：完整完成） · …”行重叠，或中间汇报/最终答复
+ * 拼接产生多行）。保留第一行，删除后续重复完成态行（用户要求“删除最后一行”）。
+ *
+ * 对纯模型查询，正文已明确报出同一模型时，完成态行没有新增信息，直接隐藏，避免卡片两行重复。
+ */
+function dedupeCompletionMetaLines(text) {
+  const s = String(text || "");
+  if (!s.trim()) {
+    return s;
+  }
+  const lines = s.split("\n");
+  const completionRe = /^[（(](?:完成|完成态)[^）)]*[）)][^·]*\s*·\s*完成时间/;
+  const completionIdx = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (completionRe.test(lines[i].trim())) {
+      completionIdx.push(i);
+    }
+  }
+  if (completionIdx.length === 1) {
+    const completionLine = lines[completionIdx[0]].trim();
+    const bodyLines = lines.filter((_, i) => i !== completionIdx[0] && lines[i].trim());
+    const modelMatch = completionLine.match(/\s·\s模型\s+(.+?)\s*$/);
+    const isDirectModelReply = bodyLines.length === 1
+      && /^当前(?:会话)?模型\s*[:：]/.test(bodyLines[0])
+      && modelMatch
+      && bodyLines[0].includes(modelMatch[1]);
+    return isDirectModelReply ? bodyLines[0] : s;
+  }
+  if (completionIdx.length === 0) {
+    return s;
+  }
+  const keep = new Set(completionIdx.slice(0, 1));
+  return lines
+    .filter((line, i) => !(completionIdx.includes(i) && !keep.has(i)))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function shouldSuppressCardKitFooter(entry) {
+  if (entry?.state !== "completed") {
+    return false;
+  }
+  const raw = resolveAssistantReplyContent(entry);
+  const completionRe = /^[（(](?:完成|完成态)[^）)]*[）)][^·]*\s*·\s*完成时间/m;
+  if (completionRe.test(raw)) {
+    return true;
+  }
+  return /^当前(?:会话)?模型\s*[:：]/.test(dedupeCompletionMetaLines(raw).trim());
 }
 
 function resolveAssistantReplyContent(entry) {
@@ -643,11 +1190,11 @@ function resolveAssistantReplyContent(entry) {
   if (entry.state === "completed") {
     return "我已经处理好了。";
   }
-  return "我正在整理正式回复。";
+  return "已收到，正在分析和执行。";
 }
 
 function buildAssistantDisplayContent(entry) {
-  const raw = resolveAssistantReplyContent(entry);
+  const raw = dedupeCompletionMetaLines(resolveAssistantReplyContent(entry));
   const explicitProcessText = typeof entry.processText === "string" ? entry.processText.trim() : "";
   if (entry.state !== "completed") {
     return {
@@ -662,48 +1209,158 @@ function buildAssistantDisplayContent(entry) {
     };
   }
   const split = splitAssistantReplyForDisplay(raw);
+  const formattedAnswer = formatCardKitAssistantMarkdown(split.answerText);
+  if (Buffer.byteLength(formattedAnswer, "utf8") > CARDKIT_BODY_MAX_BYTES) {
+    const chunks = splitLongText(formattedAnswer, CARDKIT_BODY_MAX_BYTES);
+    const first = chunks[0] || formattedAnswer;
+    return {
+      answer: `${first}\n\n_（回复较长，剩余内容已分片发送，请往下看）_`,
+      notes: formatCardKitThinkingMarkdown(split.preAnswerText),
+      chunks: chunks.slice(1),
+    };
+  }
   return {
-    answer: formatCardKitAssistantMarkdown(split.answerText),
+    answer: formattedAnswer,
     notes: formatCardKitThinkingMarkdown(split.preAnswerText),
   };
 }
 
-function buildCardKitFooter(runtime, entry) {
-  const parts = [];
-  if (entry.state === "failed") {
-    parts.push("未完成");
-  } else if (entry.state === "completed") {
-    parts.push("已完成");
-  } else {
-    parts.push("正在回复");
+function resolveConfiguredReplyModel(runtime, threadId) {
+  const normalizedThreadId = typeof threadId === "string" ? threadId.trim() : "";
+  if (!normalizedThreadId) {
+    return "";
   }
 
+  const bindingKey = runtime?.bindingKeyByThreadId?.get?.(normalizedThreadId) || "";
+  const workspaceRoot = typeof runtime?.resolveWorkspaceRootForThread === "function"
+    ? runtime.resolveWorkspaceRootForThread(normalizedThreadId)
+    : runtime?.workspaceRootByThreadId?.get?.(normalizedThreadId) || "";
+  if (!bindingKey || !workspaceRoot || typeof runtime?.getCodexParamsForWorkspace !== "function") {
+    return "";
+  }
+
+  const params = runtime.getCodexParamsForWorkspace(bindingKey, workspaceRoot);
+  return typeof params?.model === "string" ? params.model.trim() : "";
+}
+
+function resolveConfiguredReplyEffort(runtime, threadId) {
+  const normalizedThreadId = typeof threadId === "string" ? threadId.trim() : "";
+  if (!normalizedThreadId) {
+    return "";
+  }
+
+  const bindingKey = runtime?.bindingKeyByThreadId?.get?.(normalizedThreadId) || "";
+  const workspaceRoot = typeof runtime?.resolveWorkspaceRootForThread === "function"
+    ? runtime.resolveWorkspaceRootForThread(normalizedThreadId)
+    : runtime?.workspaceRootByThreadId?.get?.(normalizedThreadId) || "";
+  if (!bindingKey || !workspaceRoot || typeof runtime?.getCodexParamsForWorkspace !== "function") {
+    return "";
+  }
+
+  const params = runtime.getCodexParamsForWorkspace(bindingKey, workspaceRoot);
+  return typeof params?.effort === "string" ? params.effort.trim() : "";
+}
+
+function resolveReplyCardModel(runtime, entry) {
+  const capturedModel = typeof entry?.model === "string" ? entry.model.trim() : "";
+  if (capturedModel) {
+    return capturedModel;
+  }
+
+  return resolveConfiguredReplyModel(runtime, entry?.threadId)
+    || String(runtime?.config?.defaultCodexModel || "").trim()
+    || "Codex";
+}
+
+function resolveReplyCardEffort(runtime, entry) {
+  const capturedEffort = typeof entry?.effort === "string" ? entry.effort.trim() : "";
+  if (capturedEffort) {
+    return capturedEffort;
+  }
+
+  return resolveConfiguredReplyEffort(runtime, entry?.threadId)
+    || String(runtime?.config?.defaultCodexEffort || "").trim();
+}
+
+function buildCardKitFooter(runtime, entry) {
+  if (shouldSuppressCardKitFooter(entry)) {
+    return [];
+  }
+
+  const elements = [];
+  const headline = [];
+  const model = resolveReplyCardModel(runtime, entry);
+  if (model) {
+    headline.push(`🧠 ${model}`);
+  }
+  const effort = resolveReplyCardEffort(runtime, entry);
+  if (effort) {
+    headline.push(`💪 强度 ${effort}`);
+  }
   const elapsed = formatReplyElapsed(entry.startedAt);
   if (elapsed) {
-    parts.push(`耗时 ${elapsed}`);
+    headline.push(`⏳ 耗时 ${elapsed}`);
   }
-  if (runtime.config.defaultCodexModel) {
-    parts.push(runtime.config.defaultCodexModel);
-  }
+  elements.push({
+    tag: "markdown",
+    content: `<font color='cus-foot-grey'>${headline.join(" · ")}</font>`,
+    text_size: "notation",
+    margin: "4px 0px 0px 0px",
+  });
 
-  const usageText = formatUsageText(runtime.latestTokenUsageByThreadId.get(entry.threadId));
-  if (usageText) {
-    parts.push(usageText);
-  }
+  return elements;
+}
 
-  const contextText = formatContextText(runtime.latestTokenUsageByThreadId.get(entry.threadId));
-  if (contextText) {
-    parts.push(contextText);
+function parseContextPercent(contextText) {
+  const text = String(contextText || "").trim();
+  const m = text.match(/^上下文\s+([0-9][0-9.,]*[kKmM]?)\/([0-9][0-9.,]*[kKmM]?)\s+\((\d+)%\)(?:\s*·\s*(.*))?$/);
+  if (!m) {
+    return null;
   }
+  return {
+    usedText: m[1],
+    windowText: m[2],
+    pct: Math.max(0, Math.min(100, Number(m[3]) || 0)),
+    advisory: m[4] || "",
+  };
+}
 
-  const toolCountText = formatToolCountText(runtime.toolItemIdsByRunKey.get(
-    codexMessageUtils.buildRunKey(entry.threadId, entry.turnId)
-  ));
-  if (toolCountText) {
-    parts.push(toolCountText);
+function buildEmojiProgressBar(pct, width = 5) {
+  const raw = Math.round((pct / 100) * width);
+  const filled = pct > 0 ? Math.max(1, Math.min(width, raw)) : 0;
+  const block = pct >= 90 ? "🟥" : pct >= 70 ? "🟧" : "🟩";
+  return block.repeat(filled) + "⬜".repeat(width - filled);
+}
+
+function buildNativeProgressBarText(pct, cells = 7) {
+  const safePct = Math.max(0, Math.min(100, Number(pct) || 0));
+  const filled = safePct > 0 ? Math.max(1, Math.round((safePct / 100) * cells)) : 0;
+  const color = safePct >= 90 ? "cus-progress-red" : safePct >= 70 ? "cus-progress-yellow" : "cus-progress-green";
+  const parts = [];
+  for (let i = 0; i < cells; i += 1) {
+    parts.push(`<font color='${i < filled ? color : "grey-200"}'>▊</font>`);
   }
+  return parts.join(" ");
+}
 
-  return parts.join(" · ");
+function buildCardKitHeaderTitle(entry) {
+  if (entry?.state === "failed") {
+    return "🔴 未完成";
+  }
+  if (entry?.state === "completed") {
+    return "✅ 已完成";
+  }
+  return "🟡 正在回复";
+}
+
+function buildCardKitHeaderTemplate(entry) {
+  if (entry?.state === "failed") {
+    return "red";
+  }
+  if (entry?.state === "completed") {
+    return "green";
+  }
+  return "indigo";
 }
 
 function buildCardKitSummary(content, state) {
@@ -723,27 +1380,46 @@ function buildCardKitSummary(content, state) {
   return "正在回复。";
 }
 
-async function flushLegacyReplyCard(runtime, runKey, entry) {
+function buildLegacyReplyCard(runtime, runKey, entry) {
   const legacyDisplay = entry.state === "completed"
     ? splitAssistantReplyForDisplay(resolveAssistantReplyContent(entry))
     : { answerText: entry.text };
-  const card = buildAssistantReplyCard({
+  const chatType = typeof runtime.resolveChatType === "function"
+    ? runtime.resolveChatType(entry?.chatId)
+    : "";
+  const reasoningMode = chatType === "group"
+    ? resolveGroupCardReasoningMode(runtime?.config)
+    : "full";
+  let thinkingText = formatThinkingText({
+    state: entry.state,
+    elapsed: formatReplyElapsed(entry.startedAt),
+    reasoningTrace: runtime.reasoningTraceByRunKey?.get(runKey),
+    tokenUsage: runtime.latestTokenUsageByThreadId.get(entry.threadId),
+    assistantNotes: buildAssistantDisplayContent(entry).notes,
+  });
+  if (reasoningMode === "none") {
+    thinkingText = entry.state === "streaming"
+      ? "💭 正在推理…"
+      : "💭 推理完成";
+  } else if (reasoningMode === "brief") {
+    thinkingText = thinkingText.split("\n").slice(0, 2).join("\n");
+  }
+  return buildAssistantReplyCard({
     text: legacyDisplay.answerText,
     state: entry.state,
     elapsed: formatReplyElapsed(entry.startedAt),
-    model: runtime.config.defaultCodexModel || "Codex",
+    model: resolveReplyCardModel(runtime, entry),
+    effort: resolveReplyCardEffort(runtime, entry),
     toolText: formatToolTraceText(runtime.toolTraceByRunKey.get(runKey), entry.state),
-    thinkingText: formatThinkingText({
-      state: entry.state,
-      elapsed: formatReplyElapsed(entry.startedAt),
-      toolTrace: runtime.toolTraceByRunKey.get(runKey),
-      tokenUsage: runtime.latestTokenUsageByThreadId.get(entry.threadId),
-      assistantNotes: buildAssistantDisplayContent(entry).notes,
-    }),
+    thinkingText,
     usageText: formatUsageText(runtime.latestTokenUsageByThreadId.get(entry.threadId)),
     contextText: formatContextText(runtime.latestTokenUsageByThreadId.get(entry.threadId)),
     toolCountText: formatToolCountText(runtime.toolItemIdsByRunKey.get(runKey)),
   });
+}
+
+async function flushLegacyReplyCard(runtime, runKey, entry) {
+  const card = buildLegacyReplyCard(runtime, runKey, entry);
 
   if (!entry.messageId) {
     const response = await sendInteractiveCard(runtime, {
@@ -753,7 +1429,7 @@ async function flushLegacyReplyCard(runtime, runKey, entry) {
     });
     entry.messageId = codexMessageUtils.extractCreatedMessageId(response);
     if (!entry.messageId) {
-      return;
+      throw new Error("Feishu legacy card send did not return message_id");
     }
     runtime.setReplyCardEntry(runKey, entry);
     runtime.clearPendingReactionForThread(entry.threadId).catch((error) => {
@@ -762,7 +1438,7 @@ async function flushLegacyReplyCard(runtime, runKey, entry) {
     if (entry.state === "completed" || entry.state === "failed") {
       runtime.disposeReplyRunState(runKey, entry.threadId);
     }
-    return;
+    return { providerReceipt: entry.messageId };
   }
 
   await patchInteractiveCard(runtime, {
@@ -773,6 +1449,7 @@ async function flushLegacyReplyCard(runtime, runKey, entry) {
   if (entry.state === "completed" || entry.state === "failed") {
     runtime.disposeReplyRunState(runKey, entry.threadId);
   }
+  return { providerReceipt: entry.messageId };
 }
 
 async function enqueueReplyCardFlush(runtime, runKey) {
@@ -782,11 +1459,13 @@ async function enqueueReplyCardFlush(runtime, runKey) {
   }
 
   const flushPromise = (async () => {
+    let result;
     try {
       do {
         runtime.replyFlushQueuedByRunKey.delete(runKey);
-        await flushReplyCard(runtime, runKey);
+        result = await flushReplyCard(runtime, runKey);
       } while (runtime.replyFlushQueuedByRunKey.has(runKey));
+      return result;
     } finally {
       runtime.replyFlushInFlightByRunKey.delete(runKey);
       runtime.replyFlushQueuedByRunKey.delete(runKey);
@@ -864,6 +1543,9 @@ function disposeReplyRunState(runtime, runKey, threadId) {
     runtime.replyCardByRunKey.delete(runKey);
     runtime.toolItemIdsByRunKey.delete(runKey);
     runtime.toolTraceByRunKey.delete(runKey);
+    if (runtime.reasoningTraceByRunKey instanceof Map) {
+      runtime.reasoningTraceByRunKey.delete(runKey);
+    }
     runtime.assistantDeltaSeenByRunKey.delete(runKey);
   }
   if (threadId && runtime.currentRunKeyByThreadId.get(threadId) === runKey) {
@@ -883,7 +1565,7 @@ async function flushAssistantReplyCardNow(runtime, { threadId, turnId = "" } = {
     return;
   }
   clearReplyFlushTimer(runtime, runKey);
-  await enqueueReplyCardFlush(runtime, runKey);
+  return enqueueReplyCardFlush(runtime, runKey);
 }
 
 function formatReplyElapsed(startedAt) {
@@ -918,7 +1600,12 @@ function formatContextText(tokenUsage) {
     return "";
   }
   const pct = Math.max(0, Math.min(100, Math.round((used / window) * 100)));
-  return `上下文 ${formatCompactTokens(used)}/${formatCompactTokens(window)} (${pct}%)`;
+  const advisory = used >= 90000
+    ? " · 建议开新线程"
+    : used >= 60000
+      ? " · 上下文偏重"
+      : "";
+  return `上下文 ${formatCompactTokens(used)}/${formatCompactTokens(window)} (${pct}%)${advisory}`;
 }
 
 function formatToolCountText(toolItems) {
@@ -937,44 +1624,75 @@ function formatToolTraceText(toolTrace, state) {
     }
     return "这轮还没走到明确的工具步骤。";
   }
-  return steps.map((step) => `- ${step}`).join("\n");
+  return clipLines(steps.map((step) => `● ${step}`).join("\n"), 2);
 }
 
-function formatThinkingText({ state, elapsed, toolTrace, tokenUsage, assistantNotes = "" }) {
-  const steps = Array.isArray(toolTrace) ? toolTrace.filter(Boolean) : [];
+function formatThinkingText({
+  state,
+  elapsed,
+  reasoningTrace,
+  tokenUsage,
+  assistantNotes = "",
+}) {
+  const reasoningSteps = normalizeReasoningTrace(reasoningTrace);
   const reasoningTokens = Number(tokenUsage?.last?.reasoningOutputTokens || 0);
   const publicNotes = typeof assistantNotes === "string" ? assistantNotes.trim() : "";
+  const sections = [];
+
+  if (reasoningSteps.length) {
+    sections.push(`**模型公开推理摘要**\n${reasoningSteps.map((step, index) => (
+      `${index + 1}. ${step}`
+    )).join("\n")}`);
+  } else if (publicNotes) {
+    sections.push(`**已公开的过程说明**\n${publicNotes}`);
+  } else {
+    sections.push("**启动判断**\n- 已接收任务，先确认目标、范围和约束。");
+  }
+
+  if (state === "streaming") {
+    sections.push("**当前动作**\n- 正在拆解任务并选择下一步验证方式。");
+  }
+
   if (state === "failed") {
-    return elapsed
-      ? `这轮在 ${elapsed} 左右断流了，我没把它完整收住。`
-      : "这轮中途断掉了，所以我先停在这里。";
+    sections.push(elapsed
+      ? `**中断状态**\n- 本轮在约 ${elapsed} 时中断，已保留上面的公开过程。`
+      : "**中断状态**\n- 本轮中途断开，已保留上面的公开过程。");
+    return sections.join("\n\n");
   }
+
   if (state === "completed") {
-    if (publicNotes) {
-      const prefix = elapsed
-        ? `这轮已经收口，耗时约 ${elapsed}。下面是公开的前置上下文/过程摘要，不是隐藏推理链：`
-        : "这轮已经收口。下面是公开的前置上下文/过程摘要，不是隐藏推理链：";
-      return `${prefix}\n\n${publicNotes}`;
-    }
-    if (steps.length) {
-      return elapsed
-        ? `这轮已经收口。我先过了一遍问题，再走了 ${steps.length} 个步骤，最后在 ${elapsed} 左右把回复收好。`
-        : `这轮已经收口。我先过了一遍问题，再走了 ${steps.length} 个步骤，把回复整理好了。`;
-    }
-    if (reasoningTokens > 0) {
-      return `这轮有 ${formatCompactTokens(reasoningTokens)} 思考 token，但没有公开思考摘要；我只能展示状态摘要，不展开私密推理链。`;
-    }
-    return elapsed
-      ? `这轮已经收口。我直接把问题想顺后，在 ${elapsed} 左右把回复整理好了。`
-      : "这轮已经收口，我把回复整理好了。";
+    sections.push(elapsed
+      ? `**收口判断**\n- 已完成，耗时约 ${elapsed}；最终结论见下方正文。`
+      : "**收口判断**\n- 已完成；最终结论见下方正文。");
+  } else {
+    sections.push(elapsed
+      ? `**当前状态**\n- 仍在处理，已运行约 ${elapsed}。`
+      : "**当前状态**\n- 正在处理。");
   }
-  if (steps.length) {
-    return `我已经开始顺这轮的路子了，当前先走了 ${steps.length} 个步骤，正在往正式回复里收。`;
-  }
+
   if (reasoningTokens > 0) {
-    return `底层已经在思考，但当前没有公开思考摘要；我会显示可公开的阶段状态。`;
+    sections.push(`**思考量**\n- 本轮已使用约 ${formatCompactTokens(reasoningTokens)} 个推理 token。`);
   }
-  return "我先把你的意思接住，再把这轮回复往清楚的方向收。";
+
+  return sections.join("\n\n");
+}
+
+function clipLines(text, maxLines) {
+  const lines = String(text || "").split("\n");
+  if (lines.length <= maxLines) {
+    return text;
+  }
+  return `${lines.slice(0, maxLines).join("\n")}\n…`;
+}
+
+function normalizeReasoningTrace(trace) {
+  if (!Array.isArray(trace)) {
+    return [];
+  }
+  return trace
+    .map((entry) => String(entry?.summary || "").trim())
+    .filter(Boolean)
+    .slice(-4);
 }
 
 function formatCardKitThinkingMarkdown(text) {
@@ -1003,20 +1721,27 @@ function formatCompactTokens(value) {
 
 module.exports = {
   addPendingReaction,
+  buildAssistantDisplayContent,
+  buildCardKitFooter,
+  buildLegacyReplyCard,
   clearPendingReactionForBinding,
   clearPendingReactionForThread,
   disposeReplyRunState,
   flushAssistantReplyCardNow,
   handleCardAction,
   movePendingReactionToThread,
+  openCardKitCircuit,
   patchInteractiveCard,
   queueCardActionWithFeedback,
+  resolveReplyCardModel,
+  resolveReplyCardEffort,
   runCardActionTask,
   sendCardActionFeedback,
   sendCardActionFeedbackByContext,
   sendInfoCardMessage,
   sendInteractiveApprovalCard,
   sendInteractiveCard,
+  shouldUseCardKitReply,
   updateInteractiveCard,
   upsertAssistantReplyCard,
 };

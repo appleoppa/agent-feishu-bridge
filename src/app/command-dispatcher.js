@@ -28,6 +28,7 @@ const CARD_ACTION_KIND_METHODS = {
   panel: "handlePanelCardAction",
   thread: "handleThreadCardAction",
   workspace: "handleWorkspaceCardAction",
+  form: "handleFormCardAction",
 };
 
 const PANEL_CARD_ACTIONS = {
@@ -52,7 +53,40 @@ const PANEL_CARD_ACTIONS = {
     run: (runtime, normalized) => runtime.showStatusPanel(normalized, { replyToMessageId: normalized.messageId }),
   },
   set_model: buildPanelSelectAction(PANEL_ACTION_CONFIG.set_model),
+  add_custom_model: {
+    feedback: PANEL_ACTION_CONFIG.add_custom_model.feedback,
+    run: (runtime, normalized) => runtime.showCustomModelFormCard(normalized),
+  },
   set_effort: buildPanelSelectAction(PANEL_ACTION_CONFIG.set_effort),
+  quick_command: {
+    feedback: PANEL_ACTION_CONFIG.quick_command.feedback,
+    validate: (_runtime, _normalized, action) => {
+      if (!action.selectedValue) {
+        return { text: PANEL_ACTION_CONFIG.quick_command.missingValueText, kind: "error" };
+      }
+      return null;
+    },
+    run: (runtime, normalized, action) => (
+      runQuickCommandFromCard(runtime, normalized, action.selectedValue)
+    ),
+  },
+};
+
+const FORM_CARD_ACTIONS = {
+  bind_project: {
+    feedback: "正在绑定项目...",
+    run: (runtime, normalized, action) => runtime.bindWorkspaceFromForm(
+      normalized,
+      action?.formValue?.project_name || ""
+    ),
+  },
+  add_custom_model_save: {
+    feedback: PANEL_ACTION_CONFIG.add_custom_model_save.feedback,
+    run: (runtime, normalized, action) => runtime.saveCustomModelFromForm(
+      normalized,
+      action?.formValue || {}
+    ),
+  },
 };
 
 const THREAD_CARD_ACTIONS = {
@@ -139,6 +173,10 @@ function handleWorkspaceCardAction(runtime, action, normalized) {
   return executeMappedCardAction(runtime, normalized, action, WORKSPACE_CARD_ACTIONS);
 }
 
+function handleFormCardAction(runtime, action, normalized) {
+  return executeMappedCardAction(runtime, normalized, action, FORM_CARD_ACTIONS);
+}
+
 function executeMappedCardAction(runtime, normalized, action, actionMap) {
   const handler = actionMap[action.action];
   if (!handler) {
@@ -169,9 +207,14 @@ async function runCodexCommandFromCard(runtime, normalized, command, value) {
   if (!normalizedValue) {
     return;
   }
+  if (command === "model" && normalizedValue === "__add_custom_model__") {
+    await runtime.showCustomModelFormCard(normalized);
+    return;
+  }
   const synthetic = {
     ...normalized,
-    text: `/codex ${command} ${normalizedValue}`,
+    // 用 /前缀（与当前后端一致；parseCommand 也兼容 /codex）
+    text: `/${command} ${normalizedValue}`,
     command,
   };
   if (command === "model") {
@@ -206,9 +249,37 @@ function buildPanelSelectAction({ command, feedback, missingValueText }) {
   };
 }
 
+function runQuickCommandFromCard(runtime, normalized, selectedValue) {
+  const value = String(selectedValue || "").trim();
+  if (!value) {
+    return;
+  }
+  if (value === "/help") {
+    return runtime.handleHelpCommand(normalized);
+  }
+  if (value === "/switch_project") {
+    return runtime.sendWelcomeCard(runtime, normalized, {
+      replyToMessageId: normalized.messageId,
+    });
+  }
+  if (value === "/clear") {
+    return runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      text: "当前智能体暂不支持一键清空上下文，建议新建线程继续。",
+    });
+  }
+  return runtime.sendInfoCardMessage({
+    chatId: normalized.chatId,
+    replyToMessageId: normalized.messageId,
+    text: `暂未支持快捷指令：${value}`,
+  });
+}
+
 module.exports = {
   dispatchTextCommand,
   dispatchCardAction,
+  handleFormCardAction,
   handlePanelCardAction,
   handleThreadCardAction,
   handleWorkspaceCardAction,

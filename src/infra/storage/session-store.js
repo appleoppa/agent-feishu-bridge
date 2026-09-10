@@ -25,6 +25,7 @@ class SessionStore {
           ...parsed,
           bindings: parsed.bindings || {},
           approvalCommandAllowlistByWorkspaceRoot: parsed.approvalCommandAllowlistByWorkspaceRoot || {},
+          groupAdmins: parsed.groupAdmins || {},
           availableModelCatalog: parsed.availableModelCatalog || {
             models: [],
             updatedAt: "",
@@ -38,6 +39,15 @@ class SessionStore {
 
   save() {
     fs.writeFileSync(this.filePath, JSON.stringify(this.state, null, 2));
+  }
+
+  getGroupAdmins() {
+    return this.state.groupAdmins || {};
+  }
+
+  setGroupAdmins(groupAdmins) {
+    this.state.groupAdmins = groupAdmins || {};
+    this.save();
   }
 
   getBinding(bindingKey) {
@@ -259,9 +269,30 @@ class SessionStore {
     const hasStableThreadKey = normalizedThreadKey && normalizedThreadKey !== normalizedMessageId;
 
     if (hasStableThreadKey) {
-      return `${workspaceId}:${chatId}:thread:${normalizedThreadKey}`;
+      return `${normalizeValue(workspaceId)}:${normalizeValue(chatId)}:thread:${normalizedThreadKey}`;
     }
-    return `${workspaceId}:${chatId}:sender:${senderId}`;
+    return this.buildChatBindingKey({ workspaceId, chatId });
+  }
+
+  buildChatBindingKey({ workspaceId, chatId }) {
+    return `${normalizeValue(workspaceId)}:${normalizeValue(chatId)}:chat`;
+  }
+
+  buildLegacySenderBindingKey({ workspaceId, chatId, senderId }) {
+    return `${normalizeValue(workspaceId)}:${normalizeValue(chatId)}:sender:${normalizeValue(senderId)}`;
+  }
+
+  findLegacySenderBindingKeyForChat({ workspaceId, chatId }) {
+    const prefix = `${normalizeValue(workspaceId)}:${normalizeValue(chatId)}:sender:`;
+    if (!prefix || prefix.endsWith("::sender:")) {
+      return "";
+    }
+
+    const entries = Object.entries(this.state.bindings || {})
+      .filter(([key, binding]) => key.startsWith(prefix) && normalizeValue(binding?.activeWorkspaceRoot))
+      .sort(([, left], [, right]) => normalizeValue(right?.updatedAt).localeCompare(normalizeValue(left?.updatedAt)));
+
+    return entries[0]?.[0] || "";
   }
 
 }
@@ -274,6 +305,7 @@ function createEmptyState() {
   return {
     bindings: {},
     approvalCommandAllowlistByWorkspaceRoot: {},
+    groupAdmins: {},
     availableModelCatalog: {
       models: [],
       updatedAt: "",

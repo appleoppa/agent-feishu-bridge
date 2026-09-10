@@ -1,6 +1,25 @@
 const { readConfig } = require("../infra/config/config");
 const { SessionStore } = require("../infra/storage/session-store");
-const { CodexRpcClient } = require("../infra/codex/rpc-client");
+const { CustomModelStore } = require("../infra/storage/custom-model-store");
+// 后端可切：AGENT_BRIDGE_BACKEND=codex|opencode|claude|chuang
+// 兼容旧变量：OPENCODE_BRIDGE_BACKEND / CHUANG_BRIDGE_BACKEND / CLAUDE_BRIDGE_BACKEND
+const AGENT_BRIDGE_BACKEND =
+  process.env.AGENT_BRIDGE_BACKEND
+  || process.env.OPENCODE_BRIDGE_BACKEND
+  || process.env.CHUANG_BRIDGE_BACKEND
+  || process.env.CLAUDE_BRIDGE_BACKEND
+  || "codex";
+const { CodexRpcClient } = AGENT_BRIDGE_BACKEND === "opencode"
+  ? require("../infra/opencode/rpc-client")
+  : AGENT_BRIDGE_BACKEND === "chuang"
+    ? require("../infra/chuang/rpc-client")
+    : AGENT_BRIDGE_BACKEND === "claude"
+      ? require("../infra/claude/rpc-client")
+      : AGENT_BRIDGE_BACKEND === "pi"
+        ? require("../infra/pi/rpc-client")
+        : require("../infra/codex/rpc-client");
+// Pi 后端的 provider 名单（用于 runtime 内分支判断）
+const IS_PI_BACKEND = AGENT_BRIDGE_BACKEND === "pi";
 const {
   buildCardResponse,
   buildCardToast,
@@ -8,6 +27,7 @@ const {
   buildEffortListText,
   buildEffortValidationErrorText,
   buildHelpCardText,
+  buildCustomModelFormCard,
   buildModelInfoText,
   buildModelListText,
   buildModelValidationErrorText,
@@ -15,6 +35,7 @@ const {
   buildThreadMessagesSummary,
   buildThreadPickerCard,
   buildWorkspaceBindingsCard,
+  buildWelcomeCard,
   listBoundWorkspaces,
 } = require("../presentation/card/builders");
 const {
@@ -45,12 +66,15 @@ const approvalRuntime = require("../domain/approval/approval-service");
 const runtimeState = require("../domain/session/binding-context");
 const threadRuntime = require("../domain/thread/thread-service");
 const workspaceRuntime = require("../domain/workspace/workspace-service");
+const memberNameCache = require("../domain/group/member-name-cache");
+const groupAdminStore = require("../domain/group/group-admin-store");
 const runtimeExtensions = require("./runtime-extensions");
 const eventsRuntime = require("./codex-event-service");
 const approvalPolicyRuntime = require("../domain/approval/approval-policy");
 const appDispatcher = require("./dispatcher");
 const { extractModelCatalogFromListResponse } = require("../shared/model-catalog");
 const { extractProfileValue } = require("../shared/command-parsing");
+const { DeliveryReceiptHook } = require("./delivery-receipt-hook");
 const fs = require("fs");
 
 const CODEX_APP_SERVER_PROFILES = Object.freeze({
@@ -59,37 +83,61 @@ const CODEX_APP_SERVER_PROFILES = Object.freeze({
   openai: "",
   ...runtimeExtensions.codexProfiles.profiles,
 });
+const INBOUND_MESSAGE_DEDUP_TTL_MS = 10 * 60 * 1000;
+const MAX_RECENT_INBOUND_MESSAGE_IDS = 1000;
+const GROUP_SECURITY_ALERT_COOLDOWN_MS = 10 * 60 * 1000;
 
 class FeishuBotRuntime {
   constructor(config = readConfig()) {
     this.config = config;
     this.sessionStore = new SessionStore({ filePath: config.sessionsFile });
+    this.customModelStore = new CustomModelStore({
+      filePath: config.customModelsFile,
+    });
+    this.customModelHistoryByThreadId = new Map();
     this.codex = new CodexRpcClient({
       endpoint: config.codexEndpoint,
       env: process.env,
       codexCommand: config.codexCommand,
       appServerProfile: config.codexAppServerProfile,
+      logLevel: config.logLevel,
       requestTimeoutMs: config.codexRpcTimeoutMs,
       turnStartTimeoutMs: config.codexTurnStartTimeoutMs,
+      // Pi 后端专属参数（其余后端忽略）
+      piCommand: config.piCommand,
+      sessionDir: config.piSessionDir,
+      defaultProvider: config.piProvider,
+      turnTimeoutMs: config.piTurnTimeoutMs,
+      firstEventTimeoutMs: config.piFirstEventTimeoutMs,
     });
     this.codexAppServerProfile = config.codexAppServerProfile || "";
     this.lark = null;
     this.client = null;
     this.wsClient = null;
     this.feishuAdapter = null;
+    this.memberNameCache = memberNameCache.createMemberNameCache();
+    this.groupAdmins = groupAdminStore.createGroupAdminStore({
+      persist: (snapshot) => this.sessionStore.setGroupAdmins(snapshot),
+    });
     this.pendingChatContextByThreadId = new Map();
     this.pendingChatContextByBindingKey = new Map();
+    this.chatTypeByChatId = new Map();
     this.activeTurnIdByThreadId = new Map();
     this.activeTurnStartedAtByThreadId = new Map();
+    this.turnSteerQueueByThreadId = new Map();
+    this.turnFailureTextByRunKey = new Map();
     this.pendingApprovalByThreadId = new Map();
     this.replyCardByRunKey = new Map();
     this.currentRunKeyByThreadId = new Map();
     this.replyFlushTimersByRunKey = new Map();
     this.replyFlushInFlightByRunKey = new Map();
     this.replyFlushQueuedByRunKey = new Set();
+    this.cardKitCircuitOpenUntil = 0;
+    this.cardKitCircuitLastReason = "";
     this.latestTokenUsageByThreadId = new Map();
     this.toolItemIdsByRunKey = new Map();
     this.toolTraceByRunKey = new Map();
+    this.reasoningTraceByRunKey = new Map();
     this.assistantDeltaSeenByRunKey = new Map();
     this.pendingReactionByBindingKey = new Map();
     this.pendingReactionByThreadId = new Map();
@@ -98,7 +146,14 @@ class FeishuBotRuntime {
     this.approvalAllowlistByWorkspaceRoot = new Map();
     this.inFlightApprovalRequestKeys = new Set();
     this.sentAttachmentDirectiveKeys = new Set();
+    this.threadCreationByBindingWorkspace = new Map();
     this.resumedThreadIds = new Set();
+    this.recentInboundMessageIds = new Map();
+    this.groupSecurityAlertCooldown = new Map();
+    this.deliveryReceipts = new DeliveryReceiptHook({
+      cliPath: config.deliveryLedgerCli,
+      ledgerPath: config.deliveryLedgerPath,
+    });
     this.staleTurnWatchdog = null;
     this.extensions = runtimeExtensions;
     this.codex.onMessage((message) => appDispatcher.onCodexMessage(this, message));
@@ -109,6 +164,9 @@ class FeishuBotRuntime {
     this.initializeFeishuSdk();
     await this.codex.connect();
     await this.codex.initialize();
+    this.groupAdmins.loadFromSnapshot(this.sessionStore.getGroupAdmins());
+    // opencode 后端：SSE 订阅由 connect() 内自动建立（serve 根目录），
+    // bind 到其他目录时适配器会按需补订阅。无需在此额外启动。
     await this.refreshAvailableModelCatalogAtStartup();
     this.startLongConnection();
     this.startStaleTurnWatchdog();
@@ -120,14 +178,15 @@ class FeishuBotRuntime {
       throw new Error("FEISHU_APP_ID and FEISHU_APP_SECRET are required for feishu-bot mode");
     }
     if (!String(this.config.defaultCodexModel || "").trim()) {
-      throw new Error("CODEX_IM_DEFAULT_CODEX_MODEL is required");
+      throw new Error("AGENT_BRIDGE_DEFAULT_CODEX_MODEL is required");
     }
-    if (!String(this.config.defaultCodexEffort || "").trim()) {
-      throw new Error("CODEX_IM_DEFAULT_CODEX_EFFORT is required");
+    // Pi 后端没有 effort 概念（映射到 --thinking），不强制要求 effort 配置
+    if (!IS_PI_BACKEND && !String(this.config.defaultCodexEffort || "").trim()) {
+      throw new Error("AGENT_BRIDGE_DEFAULT_CODEX_EFFORT is required");
     }
     if (!String(this.config.defaultCodexAccessMode || "").trim()) {
       throw new Error(
-        "CODEX_IM_DEFAULT_CODEX_ACCESS_MODE is required and must be one of: default, full-access"
+        "AGENT_BRIDGE_DEFAULT_CODEX_ACCESS_MODE is required and must be one of: default, full-access"
       );
     }
   }
@@ -147,7 +206,7 @@ class FeishuBotRuntime {
       appSecret: this.config.feishu.appSecret,
       appType: this.lark.AppType.SelfBuild,
       domain: this.lark.Domain.Feishu,
-      loggerLevel: this.lark.LoggerLevel.info,
+      loggerLevel: resolveFeishuLoggerLevel(this.lark, this.config.logLevel),
     });
 
     this.wsClient = new this.lark.WSClient({
@@ -155,7 +214,7 @@ class FeishuBotRuntime {
       appSecret: this.config.feishu.appSecret,
       appType: this.lark.AppType.SelfBuild,
       domain: this.lark.Domain.Feishu,
-      loggerLevel: this.lark.LoggerLevel.info,
+      loggerLevel: resolveFeishuLoggerLevel(this.lark, this.config.logLevel),
       wsConfig: {
         PingInterval: 30,
         PingTimeout: 5,
@@ -168,11 +227,49 @@ class FeishuBotRuntime {
   startLongConnection() {
     const eventDispatcher = new this.lark.EventDispatcher({}).register({
       "im.message.receive_v1": async (data) => {
+        const messageId = String(data?.message?.message_id || "").trim();
+        // 入口日志：记录会话定位信息，便于排查消息路径（不含消息正文）
+        const chatId = String(data?.message?.chat_id || "").trim();
+        const openId = String(data?.sender?.sender_id?.open_id || "").trim();
+        const threadId = String(data?.message?.thread_id || "").trim();
+        console.log(`[codex-im] im.message.receive_v1 chat=${chatId || "-"} sender=${openId || "-"} thread=${threadId || "-"} msg=${messageId || "-"}`);
+        const ledgerClaim = await this.deliveryReceipts.claimInbound(data);
+        if (ledgerClaim.duplicate) {
+          console.warn("[codex-im] ignored duplicate Feishu message from delivery ledger");
+          return;
+        }
+        if (!claimInboundMessage(this.recentInboundMessageIds, messageId)) {
+          console.warn(`[codex-im] ignored duplicate Feishu message id=${messageId || "-"}`);
+          return;
+        }
         appDispatcher.onFeishuTextEvent(this, data).catch((error) => {
+          this.recentInboundMessageIds.delete(messageId);
           console.error(`[codex-im] failed to process Feishu message: ${error.message}`);
         });
       },
       "card.action.trigger": async (data) => appDispatcher.onFeishuCardAction(this, data),
+      "im.chat.member.bot.added_v1": async (data) => {
+        const chatId = String(data?.chat_id || "").trim();
+        const operatorOpenId = String(data?.operator_id?.open_id || "").trim();
+        if (!chatId || !operatorOpenId) {
+          return;
+        }
+        console.log(
+          `[codex-im] bot added to group chat=${chatId} by operator=${operatorOpenId.slice(0, 8)}...`
+        );
+        // 未授权群自动退群（v3.0 群聊安全铁律 #2/#3）：
+        // 只有显式配置了 groupAllowedChats 且开启 groupAutoLeave 才生效；
+        // 未配置白名单时保持旧行为（不主动退群，仅把拉入者记为管理员）。
+        const allowedChats = Array.isArray(this.config.groupAllowedChats)
+          ? this.config.groupAllowedChats
+          : [];
+        const autoLeaveEnabled = Boolean(this.config.groupAutoLeave) && allowedChats.length > 0;
+        if (autoLeaveEnabled && !allowedChats.includes(chatId)) {
+          await this.handleUnauthorizedGroupAdded(chatId, operatorOpenId);
+          return;
+        }
+        await this.groupAdmins.addAdmin(chatId, operatorOpenId);
+      },
     });
 
     this.wsClient.start({ eventDispatcher });
@@ -188,11 +285,11 @@ class FeishuBotRuntime {
     this.sessionStore.setAvailableModelCatalog(models);
     const validatedDefaults = workspaceRuntime.validateDefaultCodexParamsConfig(this, models);
     if (!validatedDefaults.model) {
-      throw new Error(`Invalid CODEX_IM_DEFAULT_CODEX_MODEL: ${this.config.defaultCodexModel}`);
+      throw new Error(`Invalid AGENT_BRIDGE_DEFAULT_CODEX_MODEL: ${this.config.defaultCodexModel}`);
     }
     if (!validatedDefaults.effort) {
       throw new Error(
-        `Invalid CODEX_IM_DEFAULT_CODEX_EFFORT: ${this.config.defaultCodexEffort} for model ${validatedDefaults.model}`
+        `Invalid AGENT_BRIDGE_DEFAULT_CODEX_EFFORT: ${this.config.defaultCodexEffort} for model ${validatedDefaults.model}`
       );
     }
     console.log(`[codex-im] model catalog refreshed at startup: ${models.length} entries`);
@@ -209,6 +306,9 @@ class FeishuBotRuntime {
         console.error(`[codex-im] stale turn watchdog failed: ${error.message}`);
       });
     }, intervalMs);
+    console.log(
+      `[codex-im] stale turn watchdog enabled timeoutMs=${timeoutMs} intervalMs=${intervalMs}`
+    );
     if (typeof this.staleTurnWatchdog.unref === "function") {
       this.staleTurnWatchdog.unref();
     }
@@ -222,14 +322,26 @@ class FeishuBotRuntime {
       }
       const context = this.pendingChatContextByThreadId.get(threadId);
       const turnId = this.activeTurnIdByThreadId.get(threadId) || "";
-      console.warn(`[codex-im] stale turn detected thread=${threadId} turn=${turnId}`);
+      console.warn(
+        `[codex-im] stale turn detected thread=${threadId} turn=${turnId}; releasing Feishu runtime state`
+      );
+      try {
+        await this.clearPendingReactionForThread(threadId);
+      } catch (error) {
+        console.error(`[codex-im] failed to clear stale turn reaction: ${error.message}`);
+      }
       this.cleanupThreadRuntimeState(threadId);
-      if (context?.chatId) {
+      if (!context?.chatId) {
+        continue;
+      }
+      try {
         await this.sendInfoCardMessage({
           chatId: context.chatId,
           replyToMessageId: context.messageId,
-          text: "检测到 Codex 长时间没有返回完成事件，我已清理飞书端运行状态。可以继续发消息；如果上一个任务仍在终端侧运行，先发 `/codex stop` 再继续更稳。",
+          text: "检测到上一轮长时间未返回完成事件，已自动解除飞书端占用。现在可以继续发消息；如果上一个任务仍在终端侧运行，先发 `/stop` 更稳。",
         });
+      } catch (error) {
+        console.error(`[codex-im] failed to notify stale turn recovery: ${error.message}`);
       }
     }
   }
@@ -240,9 +352,36 @@ class FeishuBotRuntime {
 
   getBindingContext(normalized) {
     const bindingKey = this.sessionStore.buildBindingKey(normalized);
+    const chatBindingKey = this.sessionStore.buildChatBindingKey(normalized);
+    if (bindingKey !== chatBindingKey) {
+      let workspaceRoot = this.resolveWorkspaceRootForBinding(bindingKey);
+      if (!workspaceRoot) {
+        workspaceRoot = this.inheritThreadBindingFromSender(normalized, bindingKey);
+      }
+      return { bindingKey, workspaceRoot };
+    }
+
+    let chatWorkspaceRoot = this.resolveWorkspaceRootForBinding(chatBindingKey);
+    if (!chatWorkspaceRoot) {
+      chatWorkspaceRoot = this.inheritChatBindingFromLegacySender(
+        {
+          ...normalized,
+          threadKey: "",
+          messageId: "",
+        },
+        chatBindingKey
+      );
+    }
+    if (chatWorkspaceRoot) {
+      return { bindingKey: chatBindingKey, workspaceRoot: chatWorkspaceRoot };
+    }
+
     let workspaceRoot = this.resolveWorkspaceRootForBinding(bindingKey);
     if (!workspaceRoot) {
       workspaceRoot = this.inheritThreadBindingFromSender(normalized, bindingKey);
+    }
+    if (!workspaceRoot) {
+      workspaceRoot = this.inheritChatBindingFromLegacySender(normalized, bindingKey);
     }
     return { bindingKey, workspaceRoot };
   }
@@ -255,22 +394,27 @@ class FeishuBotRuntime {
       return "";
     }
 
-    const senderBindingKey = this.sessionStore.buildBindingKey({
+    const chatBindingKey = this.sessionStore.buildBindingKey({
       ...normalized,
       threadKey: "",
       messageId: "",
     });
-    if (!senderBindingKey || senderBindingKey === bindingKey) {
-      return "";
+    let inheritedFromBindingKey = chatBindingKey;
+    let inheritedWorkspaceRoot = this.resolveWorkspaceRootForBinding(inheritedFromBindingKey);
+
+    if (!inheritedWorkspaceRoot) {
+      inheritedFromBindingKey = this.sessionStore.findLegacySenderBindingKeyForChat(normalized);
+      inheritedWorkspaceRoot = inheritedFromBindingKey
+        ? this.resolveWorkspaceRootForBinding(inheritedFromBindingKey)
+        : "";
     }
 
-    const inheritedWorkspaceRoot = this.resolveWorkspaceRootForBinding(senderBindingKey);
-    if (!inheritedWorkspaceRoot) {
+    if (!inheritedFromBindingKey || inheritedFromBindingKey === bindingKey || !inheritedWorkspaceRoot) {
       return "";
     }
 
     const inheritedParams = this.sessionStore.getCodexParamsForWorkspace(
-      senderBindingKey,
+      inheritedFromBindingKey,
       inheritedWorkspaceRoot
     );
 
@@ -283,7 +427,7 @@ class FeishuBotRuntime {
         chatId: normalized.chatId,
         threadKey: normalized.threadKey,
         senderId: normalized.senderId,
-        inheritedFromBindingKey: senderBindingKey,
+        inheritedFromBindingKey,
         threadScopedBinding: true,
       }
     );
@@ -292,7 +436,52 @@ class FeishuBotRuntime {
     }
 
     console.log(
-      `[codex-im] inherited workspace binding from sender binding for feishu thread=${threadKey} workspace=${inheritedWorkspaceRoot}`
+      `[codex-im] inherited workspace binding for feishu thread=${threadKey} from=${inheritedFromBindingKey} workspace=${inheritedWorkspaceRoot}`
+    );
+    return inheritedWorkspaceRoot;
+  }
+
+  inheritChatBindingFromLegacySender(normalized, bindingKey) {
+    const threadKey = typeof normalized?.threadKey === "string" ? normalized.threadKey.trim() : "";
+    const messageId = typeof normalized?.messageId === "string" ? normalized.messageId.trim() : "";
+    const hasStableThreadKey = threadKey && threadKey !== messageId;
+    if (hasStableThreadKey) {
+      return "";
+    }
+
+    const legacyBindingKey = this.sessionStore.findLegacySenderBindingKeyForChat(normalized);
+    if (!legacyBindingKey || legacyBindingKey === bindingKey) {
+      return "";
+    }
+
+    const inheritedWorkspaceRoot = this.resolveWorkspaceRootForBinding(legacyBindingKey);
+    if (!inheritedWorkspaceRoot) {
+      return "";
+    }
+    const inheritedParams = this.sessionStore.getCodexParamsForWorkspace(
+      legacyBindingKey,
+      inheritedWorkspaceRoot
+    );
+
+    this.sessionStore.setThreadIdForWorkspace(
+      bindingKey,
+      inheritedWorkspaceRoot,
+      "",
+      {
+        workspaceId: normalized.workspaceId,
+        chatId: normalized.chatId,
+        threadKey: "",
+        senderId: "",
+        inheritedFromBindingKey: legacyBindingKey,
+        chatScopedBinding: true,
+      }
+    );
+    if (inheritedParams.model || inheritedParams.effort) {
+      this.sessionStore.setCodexParamsForWorkspace(bindingKey, inheritedWorkspaceRoot, inheritedParams);
+    }
+
+    console.log(
+      `[codex-im] migrated legacy sender workspace binding to chat binding chat=${normalized.chatId} workspace=${inheritedWorkspaceRoot}`
     );
     return inheritedWorkspaceRoot;
   }
@@ -331,7 +520,7 @@ class FeishuBotRuntime {
     if (this.activeTurnIdByThreadId.size > 0) {
       return {
         ok: false,
-        message: "当前还有任务在运行。先等完成，或发送 `/codex stop` 后再切换运行档。",
+        message: "当前还有任务在运行。先等完成，或发送 `/stop` 后再切换运行档。",
       };
     }
 
@@ -372,7 +561,7 @@ class FeishuBotRuntime {
           `当前 Codex 运行档：${this.describeCodexAppServerProfile()}`,
           "",
           "用法：",
-          "`/codex profile main`",
+          "`/profile main`",
           ...this.getExtensionProfileHelpLines(),
           "",
           `说明：该命令会重启飞书桥背后的 Codex app-server${this.getExtensionProfileNote()}。`,
@@ -418,7 +607,7 @@ class FeishuBotRuntime {
   }
 
   buildProfileUsageText() {
-    return ["`/codex profile main`", ...this.getExtensionProfileHelpLines()].join(" 或 ");
+    return ["`/profile main`", ...this.getExtensionProfileHelpLines()].join(" 或 ");
   }
 
   buildProfileAliasListText() {
@@ -460,6 +649,7 @@ function attachRuntimeForwarders() {
     buildModelListText,
     buildModelValidationErrorText,
     buildStatusPanelCard,
+    buildWelcomeCard,
     buildThreadMessagesSummary,
     buildThreadPickerCard,
     buildWorkspaceBindingsCard,
@@ -493,6 +683,8 @@ function attachRuntimeForwarders() {
     applyApprovalDecision: approvalRuntime.applyApprovalDecision,
     sendApprovalPrompt: approvalRuntime.sendApprovalPrompt,
     handleBindCommand: workspaceRuntime.handleBindCommand,
+    bindWorkspaceFromForm: workspaceRuntime.bindWorkspaceFromForm,
+    sendWelcomeCard: workspaceRuntime.sendWelcomeCard,
     handleWhereCommand: workspaceRuntime.handleWhereCommand,
     showStatusPanel: workspaceRuntime.showStatusPanel,
     handleMessageCommand: workspaceRuntime.handleMessageCommand,
@@ -505,6 +697,8 @@ function attachRuntimeForwarders() {
     handleRemoveCommand: workspaceRuntime.handleRemoveCommand,
     handleSendCommand: workspaceRuntime.handleSendCommand,
     handleModelCommand: workspaceRuntime.handleModelCommand,
+    showCustomModelFormCard: workspaceRuntime.showCustomModelFormCard,
+    saveCustomModelFromForm: workspaceRuntime.saveCustomModelFromForm,
     handleEffortCommand: workspaceRuntime.handleEffortCommand,
     refreshWorkspaceThreads: threadRuntime.refreshWorkspaceThreads,
     describeWorkspaceStatus: threadRuntime.describeWorkspaceStatus,
@@ -522,6 +716,7 @@ function attachRuntimeForwarders() {
     handlePanelCardAction: runtimeCommands.handlePanelCardAction,
     handleThreadCardAction: runtimeCommands.handleThreadCardAction,
     handleWorkspaceCardAction: runtimeCommands.handleWorkspaceCardAction,
+    handleFormCardAction: runtimeCommands.handleFormCardAction,
     queueCardActionWithFeedback,
     runCardActionTask,
     handleApprovalCardActionAsync: approvalRuntime.handleApprovalCardActionAsync,
@@ -549,6 +744,120 @@ function attachRuntimeForwarders() {
   proto.getCodexParamsForWorkspace = function getCodexParamsForWorkspace(bindingKey, workspaceRoot) {
     return this.sessionStore.getCodexParamsForWorkspace(bindingKey, workspaceRoot);
   };
+
+  proto.setChatType = function setChatType(chatId, chatType) {
+    const normalizedChatId = typeof chatId === "string" ? chatId.trim() : "";
+    const normalizedChatType = typeof chatType === "string" ? chatType.trim().toLowerCase() : "";
+    if (!normalizedChatId || !normalizedChatType) {
+      return;
+    }
+    this.chatTypeByChatId.set(normalizedChatId, normalizedChatType);
+  };
+
+  proto.resolveChatType = function resolveChatType(chatId) {
+    const normalizedChatId = typeof chatId === "string" ? chatId.trim() : "";
+    return normalizedChatId ? String(this.chatTypeByChatId.get(normalizedChatId) || "") : "";
+  };
+
+  /**
+   * 解析群聊发送者的显示名字。
+   * 优先用成员缓存；未命中时先预取群成员（一次），仍没有则回退 open_id。
+   */
+  proto.resolveGroupSenderName = async function resolveGroupSenderName(chatId, senderId) {
+    const normalizedChatId = typeof chatId === "string" ? chatId.trim() : "";
+    const normalizedSenderId = typeof senderId === "string" ? senderId.trim() : "";
+    if (!normalizedChatId || !normalizedSenderId) {
+      return "";
+    }
+    const cached = this.memberNameCache.getMemberName(normalizedChatId, normalizedSenderId);
+    if (cached) {
+      return cached;
+    }
+    try {
+      await memberNameCache.prefetchChatMembers(this, normalizedChatId, this.memberNameCache);
+    } catch {
+      // 预取失败不阻断消息处理
+    }
+    return this.memberNameCache.getMemberName(normalizedChatId, normalizedSenderId);
+  };
+
+  /**
+   * 被拉入未授权群聊：自动退群 + 私聊告警超级管理员（v3.0 群聊安全铁律）。
+   * 不把拉入者记为管理员（该群不被授权）。
+   */
+  proto.handleUnauthorizedGroupAdded = async function handleUnauthorizedGroupAdded(chatId, operatorOpenId) {
+    const normalizedChatId = typeof chatId === "string" ? chatId.trim() : "";
+    const normalizedOperator = typeof operatorOpenId === "string" ? operatorOpenId.trim() : "";
+    console.warn(
+      `[codex-im] bot added to UNAUTHORIZED group chat=${normalizedChatId} `
+      + `by operator=${normalizedOperator.slice(0, 8)}... → auto-leave + alert`
+    );
+
+    let leftGroup = false;
+    try {
+      const adapter = this.requireFeishuAdapter();
+      const botInfo = typeof adapter.getBotInfo === "function" ? await adapter.getBotInfo() : null;
+      const botOpenId = botInfo?.openId || "";
+      if (botOpenId) {
+        if (typeof adapter.leaveGroup === "function") {
+          await adapter.leaveGroup(normalizedChatId, botOpenId);
+          leftGroup = true;
+        }
+        this.resolvedBotOpenId = botOpenId;
+      }
+    } catch (error) {
+      console.error(`[codex-im] auto-leave failed chat=${normalizedChatId}: ${error.message}`);
+    }
+
+    await this.alertSuperAdminGroupSecurity({
+      title: leftGroup
+        ? "⚠️ 检测到被拉入未授权群聊（已自动退出）"
+        : "⚠️ 检测到被拉入未授权群聊（自动退出失败，请人工处理）",
+      details: [
+        `群ID：${normalizedChatId}`,
+        `拉入者 open_id：${normalizedOperator}`,
+        `时间：${new Date().toISOString()}`,
+      ].join("\n"),
+      throttleKey: `added:${normalizedChatId}`,
+    });
+  };
+
+  /**
+   * 私聊告警超级管理员（带节流：同一 key 10 分钟内只发一次，防刷屏）。
+   */
+  proto.alertSuperAdminGroupSecurity = async function alertSuperAdminGroupSecurity({
+    title = "",
+    details = "",
+    throttleKey = "",
+  } = {}) {
+    const superAdmins = Array.isArray(this.config.superAdminOpenIds)
+      ? this.config.superAdminOpenIds
+      : [];
+    if (!superAdmins.length || !title) {
+      return;
+    }
+    const key = String(throttleKey || title).trim();
+    const now = Date.now();
+    const lastAlertAt = Number(this.groupSecurityAlertCooldown?.get(key) || 0);
+    if (now - lastAlertAt < GROUP_SECURITY_ALERT_COOLDOWN_MS) {
+      return;
+    }
+    this.groupSecurityAlertCooldown?.set(key, now);
+
+    const text = `${title}\n${details}`;
+    const adapter = this.requireFeishuAdapter();
+    for (const openId of superAdmins) {
+      try {
+        if (typeof adapter.sendTextMessageToOpenId === "function") {
+          await adapter.sendTextMessageToOpenId(openId, text);
+        }
+      } catch (error) {
+        console.error(
+          `[codex-im] super admin alert failed openId=${openId.slice(0, 8)}...: ${error.message}`
+        );
+      }
+    }
+  };
 }
 
 attachRuntimeForwarders();
@@ -572,6 +881,7 @@ async function sendLocalAttachmentWithRuntime(runtime, {
   fileBuffer,
   fileType = "stream",
   msgType = "file",
+  duration = null,
   replyToMessageId = "",
   replyInThread = false,
 }) {
@@ -589,9 +899,20 @@ async function sendLocalAttachmentWithRuntime(runtime, {
     fileBuffer,
     fileType,
     msgType,
+    duration,
     replyToMessageId,
     replyInThread,
   });
+}
+
+function resolveFeishuLoggerLevel(lark, logLevel) {
+  if (logLevel === "verbose") {
+    return lark.LoggerLevel.info;
+  }
+  if (logLevel === "quiet") {
+    return lark.LoggerLevel.error;
+  }
+  return lark.LoggerLevel.warn;
 }
 
 function maskSecret(value) {
@@ -604,4 +925,30 @@ function maskSecret(value) {
   return `${value.slice(0, 3)}***${value.slice(-3)}`;
 }
 
-module.exports = { FeishuBotRuntime };
+function claimInboundMessage(cache, messageId, now = Date.now()) {
+  const normalizedMessageId = String(messageId || "").trim();
+  if (!normalizedMessageId || !(cache instanceof Map)) {
+    return true;
+  }
+
+  for (const [id, expiresAt] of cache.entries()) {
+    if (Number(expiresAt) <= now) {
+      cache.delete(id);
+    }
+  }
+  if (Number(cache.get(normalizedMessageId) || 0) > now) {
+    return false;
+  }
+
+  cache.set(normalizedMessageId, now + INBOUND_MESSAGE_DEDUP_TTL_MS);
+  while (cache.size > MAX_RECENT_INBOUND_MESSAGE_IDS) {
+    const oldestId = cache.keys().next().value;
+    if (!oldestId) {
+      break;
+    }
+    cache.delete(oldestId);
+  }
+  return true;
+}
+
+module.exports = { FeishuBotRuntime, claimInboundMessage };
